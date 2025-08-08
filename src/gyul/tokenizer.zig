@@ -29,6 +29,8 @@ pub const Tag = enum {
     invalid,
     string_literal,
     number_literal,
+    comment_single_line,
+    comment_multi_line,
     identifier,
     eof,
     // keywords
@@ -44,6 +46,8 @@ pub const Tag = enum {
     keyword_true,
     keyword_false,
     keyword_hex,
+
+
 };
 
 pub const GYulTokenizer = struct {
@@ -68,6 +72,10 @@ pub const GYulTokenizer = struct {
         string_literal_backslash,
         number_literal,
         identifier,
+        slash,
+        comment_single_line,
+        comment_multi_line,
+        comment_multi_line_end,
         invalid,
     };
 
@@ -112,6 +120,7 @@ pub const GYulTokenizer = struct {
                     result.tag = .identifier;
                     continue :state .identifier;
                 },
+                '/' => continue :state .slash,
                 else => continue :state .invalid,
             },
             .invalid => {
@@ -171,6 +180,45 @@ pub const GYulTokenizer = struct {
                     else => continue :state .string_literal,
                 }
             },
+            .slash => {
+                self.index += 1;
+                switch (self.buffer[self.index]) {
+                    0 => result.tag = .invalid,
+                    '/' => {
+                        result.tag = .comment_single_line;
+                        continue :state .comment_single_line;
+                    },
+                    '*' => {
+                        result.tag = .comment_multi_line;
+                        continue :state .comment_multi_line;
+                    },
+                    else => {}
+                }
+            },
+            .comment_single_line => {
+                self.index += 1;
+                switch (self.buffer[self.index]) {
+                    0 => result.tag = .invalid,
+                    '\n' => {},
+                    else => continue :state .comment_single_line
+                }
+            },
+            .comment_multi_line => {
+                self.index += 1;
+                switch (self.buffer[self.index]) {
+                    0 => result.tag = .invalid,
+                    '*' => continue :state .comment_multi_line_end,
+                    else => continue :state .comment_multi_line
+                }
+            },
+            .comment_multi_line_end => {
+                self.index += 1;
+                switch (self.buffer[self.index]) {
+                    0 => result.tag = .invalid,
+                    '/' => self.index += 1,
+                    else => continue :state .comment_multi_line
+                }
+            }
         }
 
         result.loc.end = self.index;

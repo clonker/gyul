@@ -1,4 +1,9 @@
-"argh" fot for fore hello while "blah" "oof" 999
+"argh" fot for fore /* inline comment */ hello while "blah" "oof" 999
 for
-fn
+fn  // this is a comment
 end
+
+/* multi
+ * line
+ * comment
+ */ for
