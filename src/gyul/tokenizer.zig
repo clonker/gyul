@@ -32,6 +32,12 @@ pub const Tag = enum {
     comment_single_line,
     comment_multi_line,
     identifier,
+    parenthesis_l,
+    parenthesis_r,
+    bracket_l,
+    bracket_r,
+    brace_l,
+    brace_r,
     eof,
     // keywords
     keyword_function,
@@ -121,6 +127,12 @@ pub const GYulTokenizer = struct {
                     continue :state .identifier;
                 },
                 '/' => continue :state .slash,
+                '(' => { self.index += 1; result.tag = .parenthesis_l; },
+                ')' => { self.index += 1; result.tag = .parenthesis_r; },
+                '[' => { self.index += 1; result.tag = .bracket_l; },
+                ']' => { self.index += 1; result.tag = .bracket_r; },
+                '{' => { self.index += 1; result.tag = .brace_l; },
+                '}' => { self.index += 1; result.tag = .brace_r; },
                 else => continue :state .invalid,
             },
             .invalid => {
