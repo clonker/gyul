@@ -28,6 +28,8 @@ pub const Token = struct {
 pub const Tag = enum {
     invalid,
     string_literal,
+    number_literal,
+    identifier,
     eof,
     // keywords
     keyword_function,
@@ -64,6 +66,8 @@ pub const GYulTokenizer = struct {
         start,
         string_literal,
         string_literal_backslash,
+        number_literal,
+        identifier,
         invalid,
     };
 
@@ -100,6 +104,14 @@ pub const GYulTokenizer = struct {
                     result.tag = .string_literal;
                     continue :state .string_literal;
                 },
+                '0' ... '9' => {
+                    result.tag = .number_literal;
+                    continue :state .number_literal;
+                },
+                '_', 'a' ... 'z', 'A' ... 'Z' => {
+                    result.tag = .identifier;
+                    continue :state .identifier;
+                },
                 else => continue :state .invalid,
             },
             .invalid => {
@@ -129,6 +141,27 @@ pub const GYulTokenizer = struct {
                     '"' => self.index += 1,
                     0x01...0x09, 0x0b...0x1f, 0x7f => continue :state .invalid,
                     else => continue :state .string_literal,
+                }
+            },
+            .number_literal => {
+                self.index += 1;
+                switch (self.buffer[self.index]) {
+                    '0' ... '9' => {
+                        self.index += 1;
+                        continue :state .number_literal;
+                    },
+                    else => {},
+                }
+            },
+            .identifier => {
+                self.index += 1;
+                switch (self.buffer[self.index]) {
+                    'a'...'z', 'A'...'Z', '_', '0'...'9' => continue :state .identifier,
+                    else => {
+                        if (Token.keywords.get(self.buffer[result.loc.start..self.index])) |tag| {
+                            result.tag = tag;
+                        }
+                    },
                 }
             },
             .string_literal_backslash => {
