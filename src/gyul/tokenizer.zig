@@ -149,8 +149,27 @@ test "string literals" {
     const source = "\"fu\\nfu\" 8";
     var tokenizer = GYulTokenizer.init(source);
     var currentToken = tokenizer.next();
-    while(currentToken.tag != .invalid and currentToken.tag != .eof) : (currentToken = tokenizer.next()) {
+    while(currentToken.tag != .eof) : (currentToken = tokenizer.next()) {
         tokenizer.dump(&currentToken);
     }
     tokenizer.dump(&currentToken);
+}
+
+test "fuzz tokenizer" {
+    const Context = struct {
+        fn testEndInEOF(context: @This(), input: []const u8) anyerror!void {
+            _ = context;
+            const null_terminated = try std.testing.allocator.allocSentinel(u8, input.len, 0);
+            defer std.testing.allocator.free(null_terminated);
+            @memcpy(null_terminated[0..input.len], input);
+
+            var tokenizer = GYulTokenizer.init(null_terminated);
+            var currentToken = tokenizer.next();
+            while(currentToken.tag != .eof) : (currentToken = tokenizer.next()) {}
+
+            try std.testing.expectEqual(currentToken.loc.start, currentToken.loc.end);
+            try std.testing.expectEqual(currentToken.loc.start, input.len);
+        }
+    };
+    try std.testing.fuzz(Context{}, Context.testEndInEOF, .{});
 }
