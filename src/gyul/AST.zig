@@ -35,15 +35,29 @@ pub const Node = struct {
         lhs: Index,
         rhs: Index,
     };
+
+    pub const SubRange = struct {
+        /// Index into sub_list.
+        start: Index,
+        /// Index into sub_list.
+        end: Index,
+    };
 };
 pub const Error = struct {
     tag: Tag,
+    token: TokenIndex,
+    extra: union {
+        none: void,
+        expected_tag: tokenizer.Tag,
+        offset: usize,
+    } = .{ .none = {} },
+
     pub const Tag = enum {
-        type_of_error,
+        expected_token,
     };
 };
 
-pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) std.mem.Allocator.Error!Self {
+pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) !Self {
     var tokens = TokenList{};
     defer tokens.deinit(gpa);
 
@@ -64,21 +78,24 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) std.mem.Allocator.Err
         .token_tags = tokens.items(.tag),
         .token_starts = tokens.items(.start),
         .tok_i = 0,
+        .errors = .{},
         .nodes = .{},
         .extra_data = .{},
         .scratch = .{}
     };
-    defer parser.deinit(gpa);
-
-    try parser.parseRoot(gpa);
+    defer parser.scratch.deinit(gpa);
+    try parser.parseRoot();
 
     const extra_data = try parser.extra_data.toOwnedSlice(gpa);
     errdefer gpa.free(extra_data);
 
+    const errors = try parser.errors.toOwnedSlice(gpa);
+    errdefer gpa.free(errors);
+
     return Self{
         .source = source,
         .tokens = tokens.toOwnedSlice(),
-        .errors = undefined, // todo
+        .errors = errors,
         .nodes = parser.nodes.toOwnedSlice(),
         .extra_data = extra_data,
     };

@@ -34,10 +34,18 @@ pub fn main() !void {
     // tokenizer.dump(&currentToken);
 }
 
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
+test "ast" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
 
+    const filename = "src/cli/main.zig";
+    const contents = try std.fs.cwd().readFileAllocOptions(allocator, filename, 1e8, null, @alignOf(u8), 0);
+    defer allocator.free(contents);
+
+    var x = std.zig.Ast.parse(allocator, contents, .zig) catch |err| {
+        std.log.err("err: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer x.deinit(allocator);
+}
