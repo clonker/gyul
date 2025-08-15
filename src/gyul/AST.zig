@@ -1,5 +1,5 @@
 const std = @import("std");
-const tokenizer = @import("tokenizer.zig").GYulTokenizer;
+const tokenizer = @import("tokenizer.zig");
 const Parser = @import("Parser.zig");
 const Tokenizer = tokenizer.GYulTokenizer;
 
@@ -43,7 +43,7 @@ pub const Error = struct {
     };
 };
 
-pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) std.mem.Allocator.Error!NodeList {
+pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) std.mem.Allocator.Error!Self {
     var tokens = TokenList{};
     defer tokens.deinit(gpa);
 
@@ -53,7 +53,7 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) std.mem.Allocator.Err
         while(currentToken.tag != .eof) : (currentToken = lex.next()) {
             try tokens.append(gpa, .{
                 .tag = currentToken.tag,
-                .start = currentToken.loc.start
+                .start = @as(ByteOffset, currentToken.loc.start)
             });
         }
     }
@@ -68,9 +68,9 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) std.mem.Allocator.Err
         .extra_data = .{},
         .scratch = .{}
     };
-    defer Parser.deinit(parser, gpa);
+    defer parser.deinit(gpa);
 
-    try parser.parseRoot();
+    try parser.parseRoot(gpa);
 
     const extra_data = try parser.extra_data.toOwnedSlice(gpa);
     errdefer gpa.free(extra_data);
@@ -78,7 +78,16 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) std.mem.Allocator.Err
     return Self{
         .source = source,
         .tokens = tokens.toOwnedSlice(),
+        .errors = undefined, // todo
         .nodes = parser.nodes.toOwnedSlice(),
         .extra_data = extra_data,
     };
+}
+
+pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+    self.tokens.deinit(gpa);
+    self.nodes.deinit(gpa);
+    gpa.free(self.errors);
+    gpa.free(self.extra_data);
+    self.* = undefined;
 }

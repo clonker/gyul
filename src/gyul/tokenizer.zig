@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const LocationOffset = u32;
+
 pub const Token = struct {
     tag: Tag,
     loc: Loc,
@@ -20,8 +22,8 @@ pub const Token = struct {
     });
 
     pub const Loc = struct {
-        start: usize,
-        end: usize,
+        start: LocationOffset,
+        end: LocationOffset,
     };
 };
 
@@ -58,7 +60,7 @@ pub const Tag = enum {
 
 pub const GYulTokenizer = struct {
     buffer: [:0]const u8,
-    index: usize,
+    index: LocationOffset,
 
     pub fn dump(self: *GYulTokenizer, token: *const Token) void {
         std.debug.print("{s} \"{s}\"\n", .{ @tagName(token.tag), self.buffer[token.loc.start..token.loc.end] });

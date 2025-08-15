@@ -6,7 +6,7 @@ const Self = @This();
 
 gpa: std.mem.Allocator,
 source: []const u8,
-token_tags: []const tokenizer.Token.Tag,
+token_tags: []const tokenizer.Tag,
 token_starts: []const ast.ByteOffset,
 tok_i: ast.TokenIndex,
 nodes: ast.NodeList,
@@ -19,13 +19,11 @@ pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
     self.scratch.deinit(gpa);
 }
 
-pub fn parseRoot(self: *Self) !void {
-    self.nodes.appendAssumeCapacity(.{
+pub fn parseRoot(self: *Self, gpa: std.mem.Allocator) !void {
+    try self.nodes.append(gpa, .{
         .tag = .root,
-        .main_token = 0,
         .data = undefined,
     });
-    self.*.tok_i = 33;
 }
 
 fn eatToken(self: *Self, tag: tokenizer.Tag) ?ast.TokenIndex {

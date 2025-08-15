@@ -18,12 +18,20 @@ pub fn main() !void {
     const contents = try std.fs.cwd().readFileAllocOptions(allocator, filename, 1e8, null, @alignOf(u8), 0);
     defer allocator.free(contents);
 
-    var tokenizer = gyul.GYulTokenizer.init(contents);
-    var currentToken = tokenizer.next();
-    while(currentToken.tag != .eof) : (currentToken = tokenizer.next()) {
-        tokenizer.dump(&currentToken);
-    }
-    tokenizer.dump(&currentToken);
+    var ast = gyul.AST.parse(allocator, contents) catch |err| {
+        std.log.err("err: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer ast.deinit(allocator);
+
+    std.debug.print("len: {}\n", .{ast.nodes.len});
+
+    // var tokenizer = gyul.GYulTokenizer.init(contents);
+    // var currentToken = tokenizer.next();
+    // while(currentToken.tag != .eof) : (currentToken = tokenizer.next()) {
+    //     tokenizer.dump(&currentToken);
+    // }
+    // tokenizer.dump(&currentToken);
 }
 
 test "simple test" {
