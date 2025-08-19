@@ -63,7 +63,7 @@ pub const GYulTokenizer = struct {
     index: LocationOffset,
 
     pub fn dump(self: *GYulTokenizer, token: *const Token) void {
-        std.debug.print("{s} \"{s}\"\n", .{ @tagName(token.tag), self.buffer[token.loc.start..token.loc.end] });
+        std.debug.print("{s} \"{s}\": [{}:{}]\n", .{ @tagName(token.tag), self.buffer[token.loc.start..token.loc.end], token.loc.start, token.loc.end });
     }
 
     pub fn init(buffer: [:0]const u8) GYulTokenizer {

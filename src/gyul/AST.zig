@@ -1,6 +1,7 @@
 const std = @import("std");
 const tokenizer = @import("tokenizer.zig");
 const Parser = @import("Parser.zig");
+const Printer = @import("ASTPrinter.zig");
 const Tokenizer = tokenizer.GYulTokenizer;
 
 const Self = @This();
@@ -99,6 +100,10 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) !Self {
         .nodes = parser.nodes.toOwnedSlice(),
         .extra_data = extra_data,
     };
+}
+
+pub fn print(self: *Self, gpa: std.mem.Allocator) ![]u8 {
+    return Printer.print(gpa, self);
 }
 
 pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
