@@ -7,121 +7,355 @@ const Parser = @This();
 pub const Error = error{ParseError} || std.mem.Allocator.Error;
 
 gpa: std.mem.Allocator,
-source: []const u8,
+source: [:0]const u8,
 token_tags: []const tokenizer.Tag,
 token_starts: []const ast.ByteOffset,
 tok_i: ast.TokenIndex,
 errors: std.ArrayListUnmanaged(ast.Error),
-nodes: ast.NodeList,
-extra_data: std.ArrayListUnmanaged(ast.Node.Index),
-scratch: std.ArrayListUnmanaged(ast.Node.Index),
+nodes: std.ArrayListUnmanaged(ast.Node),
+extra: std.ArrayListUnmanaged(ast.NodeIndex),
+scratch: std.ArrayListUnmanaged(ast.NodeIndex),
 
-const Members = struct {
-    len: usize,
-    lhs: ast.Node.Index,
-    rhs: ast.Node.Index,
-    trailing: bool,
-
-    fn toSpan(self: Members, parser: *Parser) !ast.Node.SubRange {
-        if (self.len <= 2) {
-            const nodes = [2]ast.Node.Index{ self.lhs, self.rhs };
-            return parser.listToSpan(nodes[0..self.len]);
-        } else {
-            return ast.Node.SubRange{ .start = self.lhs, .end = self.rhs };
-        }
-    }
-};
-
-pub fn deinit(self: *Parser) void {
-    self.nodes.deinit(self.gpa);
-    self.extra_data.deinit(self.gpa);
-    self.scratch.deinit(self.gpa);
-}
+// --- Public API ---
 
 pub fn parseRoot(self: *Parser) !void {
+    // Reserve slot 0 for the root node
+    try self.nodes.append(self.gpa, undefined);
+
     self.eatComments();
-    _ = try expectToken(self, .brace_l);
-    try self.nodes.append(self.gpa, .{
-        .tag = .root,
-        .data = undefined,
-    });
+    const lbrace = try self.expectToken(.brace_l);
 
-    // Skip body tokens until closing brace
-    // TODO: replace with proper member/statement parsing
-    while (self.tok_i < self.token_tags.len and self.token_tags[self.tok_i] != .brace_r) {
-        _ = self.nextToken();
-    }
-
-    _ = try expectToken(self, .brace_r);
-}
-
-fn parseBlock(self: *Parser) Error!ast.Node.Index {
-    self.eatComments();
     const scratch_top = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(scratch_top);
-    _ = try self.expectToken(.brace_l);
-    while (true) {
-        if (self.tok_i >= self.token_tags.len or self.token_tags[self.tok_i] == .brace_r) break;
-        const statement = try self.parseStatement();
-        if (statement == 0) break;
-        try self.scratch.append(self.gpa, statement);
+
+    while (self.peek() != .brace_r and self.peek() != .eof) {
+        const stmt = try self.parseStatement();
+        try self.scratch.append(self.gpa, stmt);
     }
     _ = try self.expectToken(.brace_r);
-    const statements = self.scratch.items[scratch_top..];
-    return switch (statements.len) {
-        0 => try self.addNode(.{
-            .tag = .block2,
-            .data = .{ .lhs = 0, .rhs = 0 },
+
+    const body = self.addSpan(self.scratch.items[scratch_top..]);
+    self.nodes.items[0] = .{ .root = .{ .token = lbrace, .body = body } };
+}
+
+// --- Statements ---
+
+fn parseStatement(self: *Parser) Error!ast.NodeIndex {
+    self.eatComments();
+    return switch (self.peek()) {
+        .brace_l => self.parseBlock(),
+        .keyword_let => self.parseVariableDeclaration(),
+        .keyword_if => self.parseIf(),
+        .keyword_for => self.parseForLoop(),
+        .keyword_switch => self.parseSwitch(),
+        .keyword_function => self.parseFunctionDefinition(),
+        .keyword_break => self.parseBreak(),
+        .keyword_continue => self.parseContinue(),
+        .keyword_leave => self.parseLeave(),
+        .identifier => self.parseIdentifierStatement(),
+        else => self.failMsg(.{
+            .tag = .expected_statement,
+            .token = self.tok_i,
         }),
-        1 => try self.addNode(.{
-            .tag = .block2,
-            .data = .{ .lhs = statements[0], .rhs = 0 },
-        }),
-        2 => try self.addNode(.{
-            .tag = .block2,
-            .data = .{ .lhs = statements[0], .rhs = statements[1] },
-        }),
-        else => blk: {
-            const span = try self.listToSpan(statements);
-            break :blk try self.addNode(.{
-                .tag = .block,
-                .data = .{ .lhs = span.start, .rhs = span.end },
-            });
-        },
     };
 }
 
-fn parseStatement(self: *Parser) Error!ast.Node.Index {
+fn parseBlock(self: *Parser) Error!ast.NodeIndex {
     self.eatComments();
-    if (self.tok_i >= self.token_tags.len) return 0;
-    // TODO: implement statement parsing for each keyword
-    // For now, skip tokens until we hit a closing brace or EOF
-    _ = self.nextToken();
-    return 0;
+    const lbrace = try self.expectToken(.brace_l);
+
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+
+    while (self.peek() != .brace_r and self.peek() != .eof) {
+        const stmt = try self.parseStatement();
+        try self.scratch.append(self.gpa, stmt);
+    }
+    _ = try self.expectToken(.brace_r);
+
+    const stmts = self.addSpan(self.scratch.items[scratch_top..]);
+    return self.addNode(.{ .block = .{ .token = lbrace, .stmts = stmts } });
+}
+
+fn parseVariableDeclaration(self: *Parser) Error!ast.NodeIndex {
+    const tok = self.nextToken(); // consume `let`
+
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+
+    try self.scratch.append(self.gpa, try self.parseIdentifierNode());
+    while (self.peek() == .comma) {
+        _ = self.nextToken();
+        try self.scratch.append(self.gpa, try self.parseIdentifierNode());
+    }
+
+    const names = self.addSpan(self.scratch.items[scratch_top..]);
+
+    var value: ast.NodeIndex = ast.null_node;
+    if (self.peek() == .colon_assign) {
+        _ = self.nextToken();
+        value = try self.parseExpression();
+    }
+
+    return self.addNode(.{ .variable_declaration = .{
+        .token = tok,
+        .names = names,
+        .value = value,
+    } });
+}
+
+fn parseIf(self: *Parser) Error!ast.NodeIndex {
+    const tok = self.nextToken(); // consume `if`
+    const condition = try self.parseExpression();
+    const body = try self.parseBlock();
+    return self.addNode(.{ .if_statement = .{
+        .token = tok,
+        .condition = condition,
+        .body = body,
+    } });
+}
+
+fn parseForLoop(self: *Parser) Error!ast.NodeIndex {
+    const tok = self.nextToken(); // consume `for`
+    const pre = try self.parseBlock();
+    const condition = try self.parseExpression();
+    const post = try self.parseBlock();
+    const body = try self.parseBlock();
+    return self.addNode(.{ .for_loop = .{
+        .token = tok,
+        .pre = pre,
+        .condition = condition,
+        .post = post,
+        .body = body,
+    } });
+}
+
+fn parseSwitch(self: *Parser) Error!ast.NodeIndex {
+    const tok = self.nextToken(); // consume `switch`
+    const expr = try self.parseExpression();
+
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+
+    while (self.peek() == .keyword_case or self.peek() == .keyword_default) {
+        if (self.peek() == .keyword_default) {
+            const default_tok = self.nextToken();
+            const body = try self.parseBlock();
+            const node = try self.addNode(.{ .case_default = .{
+                .token = default_tok,
+                .body = body,
+            } });
+            try self.scratch.append(self.gpa, node);
+        } else {
+            const case_tok = self.nextToken();
+            const value = try self.parseLiteral();
+            const body = try self.parseBlock();
+            const node = try self.addNode(.{ .case_clause = .{
+                .token = case_tok,
+                .value = value,
+                .body = body,
+            } });
+            try self.scratch.append(self.gpa, node);
+        }
+    }
+
+    const cases = self.addSpan(self.scratch.items[scratch_top..]);
+    return self.addNode(.{ .switch_statement = .{
+        .token = tok,
+        .expr = expr,
+        .cases = cases,
+    } });
+}
+
+fn parseFunctionDefinition(self: *Parser) Error!ast.NodeIndex {
+    const tok = self.nextToken(); // consume `function`
+    const name = try self.expectToken(.identifier);
+    _ = try self.expectToken(.parenthesis_l);
+
+    // Parse parameters
+    const params_top = self.scratch.items.len;
+    if (self.peek() == .identifier) {
+        try self.scratch.append(self.gpa, try self.parseIdentifierNode());
+        while (self.peek() == .comma) {
+            _ = self.nextToken();
+            try self.scratch.append(self.gpa, try self.parseIdentifierNode());
+        }
+    }
+    _ = try self.expectToken(.parenthesis_r);
+    const params = self.addSpan(self.scratch.items[params_top..]);
+    self.scratch.shrinkRetainingCapacity(params_top);
+
+    // Parse return variables
+    const rets_top = self.scratch.items.len;
+    if (self.peek() == .arrow) {
+        _ = self.nextToken();
+        try self.scratch.append(self.gpa, try self.parseIdentifierNode());
+        while (self.peek() == .comma) {
+            _ = self.nextToken();
+            try self.scratch.append(self.gpa, try self.parseIdentifierNode());
+        }
+    }
+    const return_vars = self.addSpan(self.scratch.items[rets_top..]);
+    self.scratch.shrinkRetainingCapacity(rets_top);
+
+    const body = try self.parseBlock();
+
+    return self.addNode(.{ .function_definition = .{
+        .token = tok,
+        .name = name,
+        .params = params,
+        .return_vars = return_vars,
+        .body = body,
+    } });
+}
+
+fn parseBreak(self: *Parser) Error!ast.NodeIndex {
+    const tok = self.nextToken();
+    return self.addNode(.{ .@"break" = .{ .token = tok } });
+}
+
+fn parseContinue(self: *Parser) Error!ast.NodeIndex {
+    const tok = self.nextToken();
+    return self.addNode(.{ .@"continue" = .{ .token = tok } });
+}
+
+fn parseLeave(self: *Parser) Error!ast.NodeIndex {
+    const tok = self.nextToken();
+    return self.addNode(.{ .leave = .{ .token = tok } });
+}
+
+fn parseIdentifierStatement(self: *Parser) Error!ast.NodeIndex {
+    // Could be: function call or assignment
+    const ident = try self.parseIdentifierNode();
+
+    if (self.peek() == .parenthesis_l) {
+        // Function call as statement
+        const call = try self.parseFunctionCallWithToken(self.nodes.items[ident].identifier.token);
+        return self.addNode(.{ .expression_statement = .{
+            .token = self.nodes.items[call].function_call.token,
+            .expr = call,
+        } });
+    }
+
+    // Assignment: x, y, z := expr
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+    try self.scratch.append(self.gpa, ident);
+
+    while (self.peek() == .comma) {
+        _ = self.nextToken();
+        try self.scratch.append(self.gpa, try self.parseIdentifierNode());
+    }
+
+    const assign_tok = try self.expectToken(.colon_assign);
+    const value = try self.parseExpression();
+    const targets = self.addSpan(self.scratch.items[scratch_top..]);
+
+    return self.addNode(.{ .assignment = .{
+        .token = assign_tok,
+        .targets = targets,
+        .value = value,
+    } });
+}
+
+// --- Expressions ---
+
+fn parseExpression(self: *Parser) Error!ast.NodeIndex {
+    self.eatComments();
+    return switch (self.peek()) {
+        .identifier => self.parseIdentifierExpression(),
+        .number_literal, .hex_number_literal => self.parseNumberLiteral(),
+        .string_literal => self.parseStringLiteral(),
+        .keyword_true, .keyword_false => self.parseBoolLiteral(),
+        .keyword_hex => self.parseHexLiteral(),
+        else => self.failMsg(.{
+            .tag = .expected_expression,
+            .token = self.tok_i,
+        }),
+    };
+}
+
+fn parseLiteral(self: *Parser) Error!ast.NodeIndex {
+    self.eatComments();
+    return switch (self.peek()) {
+        .number_literal, .hex_number_literal => self.parseNumberLiteral(),
+        .string_literal => self.parseStringLiteral(),
+        .keyword_true, .keyword_false => self.parseBoolLiteral(),
+        .keyword_hex => self.parseHexLiteral(),
+        else => self.failMsg(.{
+            .tag = .expected_expression,
+            .token = self.tok_i,
+        }),
+    };
+}
+
+fn parseIdentifierExpression(self: *Parser) Error!ast.NodeIndex {
+    const ident = try self.parseIdentifierNode();
+    if (self.peek() == .parenthesis_l) {
+        return self.parseFunctionCallWithToken(self.nodes.items[ident].identifier.token);
+    }
+    return ident;
+}
+
+fn parseFunctionCallWithToken(self: *Parser, name_token: ast.TokenIndex) Error!ast.NodeIndex {
+    _ = try self.expectToken(.parenthesis_l);
+
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+
+    if (self.peek() != .parenthesis_r) {
+        try self.scratch.append(self.gpa, try self.parseExpression());
+        while (self.peek() == .comma) {
+            _ = self.nextToken();
+            try self.scratch.append(self.gpa, try self.parseExpression());
+        }
+    }
+    _ = try self.expectToken(.parenthesis_r);
+
+    const args = self.addSpan(self.scratch.items[scratch_top..]);
+    return self.addNode(.{ .function_call = .{ .token = name_token, .args = args } });
+}
+
+fn parseIdentifierNode(self: *Parser) Error!ast.NodeIndex {
+    const tok = try self.expectToken(.identifier);
+    return self.addNode(.{ .identifier = .{ .token = tok } });
+}
+
+fn parseNumberLiteral(self: *Parser) Error!ast.NodeIndex {
+    const tok = self.nextToken();
+    return self.addNode(.{ .number_literal = .{ .token = tok } });
+}
+
+fn parseStringLiteral(self: *Parser) Error!ast.NodeIndex {
+    const tok = self.nextToken();
+    return self.addNode(.{ .string_literal = .{ .token = tok } });
+}
+
+fn parseBoolLiteral(self: *Parser) Error!ast.NodeIndex {
+    const tok = self.nextToken();
+    return self.addNode(.{ .bool_literal = .{ .token = tok } });
+}
+
+fn parseHexLiteral(self: *Parser) Error!ast.NodeIndex {
+    const tok = self.nextToken(); // `hex` keyword
+    const value = try self.expectToken(.string_literal);
+    return self.addNode(.{ .hex_literal = .{ .token = tok, .value = value } });
+}
+
+// --- Helpers ---
+
+fn peek(self: *Parser) tokenizer.Tag {
+    if (self.tok_i >= self.token_tags.len) return .eof;
+    return self.token_tags[self.tok_i];
 }
 
 fn eatComments(self: *Parser) void {
-    while (
-        self.tok_i < self.token_tags.len and
-        (self.token_tags[self.tok_i] == .comment_single_line or self.token_tags[self.tok_i] == .comment_multi_line)
-    ) {
+    while (self.tok_i < self.token_tags.len and
+        (self.token_tags[self.tok_i] == .comment_single_line or
+        self.token_tags[self.tok_i] == .comment_multi_line))
+    {
         _ = self.nextToken();
     }
-}
-
-fn eatToken(self: *Parser, tag: tokenizer.Tag) ?ast.TokenIndex {
-    return if (self.token_tags[self.tok_i] == tag) self.nextToken() else null;
-}
-
-fn expectToken(p: *Parser, tag: tokenizer.Tag) Error!ast.TokenIndex {
-    if (p.token_tags[p.tok_i] != tag) {
-        return p.failMsg(.{
-            .tag = .expected_token,
-            .token = p.tok_i,
-            .extra = .{ .expected_tag = tag },
-        });
-    }
-    return p.nextToken();
 }
 
 fn nextToken(self: *Parser) ast.TokenIndex {
@@ -130,38 +364,36 @@ fn nextToken(self: *Parser) ast.TokenIndex {
     return result;
 }
 
-fn failMsg(p: *Parser, msg: ast.Error) error{ ParseError, OutOfMemory } {
+fn expectToken(self: *Parser, tag: tokenizer.Tag) Error!ast.TokenIndex {
+    if (self.peek() != tag) {
+        return self.failMsg(.{
+            .tag = .expected_token,
+            .token = self.tok_i,
+            .extra = .{ .expected_tag = tag },
+        });
+    }
+    return self.nextToken();
+}
+
+fn addNode(self: *Parser, node: ast.Node) Error!ast.NodeIndex {
+    const idx: ast.NodeIndex = @intCast(self.nodes.items.len);
+    try self.nodes.append(self.gpa, node);
+    return idx;
+}
+
+fn addSpan(self: *Parser, items: []const ast.NodeIndex) ast.Span {
+    const start: u32 = @intCast(self.extra.items.len);
+    self.extra.appendSlice(self.gpa, items) catch @panic("OOM");
+    return .{ .start = start, .len = @intCast(items.len) };
+}
+
+fn failMsg(self: *Parser, msg: ast.Error) error{ ParseError, OutOfMemory } {
     @branchHint(.cold);
-    try p.warnMsg(msg);
+    try self.warnMsg(msg);
     return error.ParseError;
 }
 
-fn tokensOnSameLine(p: *Parser, token1: ast.TokenIndex, token2: ast.TokenIndex) bool {
-    return std.mem.indexOfScalar(u8, p.source[p.token_starts[token1]..p.token_starts[token2]], '\n') == null;
-}
-
-fn warnMsg(p: *Parser, msg: ast.Error) error{OutOfMemory}!void {
+fn warnMsg(self: *Parser, msg: ast.Error) error{OutOfMemory}!void {
     @branchHint(.cold);
-    switch (msg.tag) {
-        .expected_token => if (msg.token != 0 and !p.tokensOnSameLine(msg.token - 1, msg.token)) {
-            var copy = msg;
-            copy.token -= 1;
-            return p.errors.append(p.gpa, copy);
-        },
-    }
-    try p.errors.append(p.gpa, msg);
-}
-
-fn addNode(self: *Parser, elem: ast.Node) std.mem.Allocator.Error!ast.Node.Index {
-    const result = @as(ast.Node.Index, @intCast(self.nodes.len));
-    try self.nodes.append(self.gpa, elem);
-    return result;
-}
-
-fn listToSpan(self: *Parser, list: []const ast.Node.Index) !ast.Node.SubRange {
-    try self.extra_data.appendSlice(self.gpa, list);
-    return ast.Node.SubRange{
-        .start = @as(ast.Node.Index, @intCast(self.extra_data.items.len - list.len)),
-        .end = @as(ast.Node.Index, @intCast(self.extra_data.items.len)),
-    };
+    try self.errors.append(self.gpa, msg);
 }

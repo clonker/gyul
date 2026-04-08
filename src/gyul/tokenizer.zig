@@ -7,7 +7,7 @@ pub const Token = struct {
     loc: Loc,
 
     pub const keywords = std.StaticStringMap(Tag).initComptime(.{
-        .{ "fn", Tag.keyword_function },
+        .{ "function", Tag.keyword_function },
         .{ "let", Tag.keyword_let },
         .{ "if", Tag.keyword_if },
         .{ "switch", Tag.keyword_switch },
@@ -16,6 +16,7 @@ pub const Token = struct {
         .{ "for", Tag.keyword_for },
         .{ "break", Tag.keyword_break },
         .{ "continue", Tag.keyword_continue },
+        .{ "leave", Tag.keyword_leave },
         .{ "true", Tag.keyword_true },
         .{ "false", Tag.keyword_false },
         .{ "hex", Tag.keyword_hex },
@@ -31,6 +32,7 @@ pub const Tag = enum {
     invalid,
     string_literal,
     number_literal,
+    hex_number_literal,
     comment_single_line,
     comment_multi_line,
     identifier,
@@ -40,6 +42,9 @@ pub const Tag = enum {
     bracket_r,
     brace_l,
     brace_r,
+    colon_assign,
+    arrow,
+    comma,
     eof,
     // keywords
     keyword_function,
@@ -51,11 +56,10 @@ pub const Tag = enum {
     keyword_for,
     keyword_break,
     keyword_continue,
+    keyword_leave,
     keyword_true,
     keyword_false,
     keyword_hex,
-
-
 };
 
 pub const GYulTokenizer = struct {
@@ -79,8 +83,12 @@ pub const GYulTokenizer = struct {
         string_literal,
         string_literal_backslash,
         number_literal,
+        number_literal_zero,
+        hex_number_literal,
         identifier,
         slash,
+        colon,
+        minus,
         comment_single_line,
         comment_multi_line,
         comment_multi_line_end,
@@ -120,7 +128,11 @@ pub const GYulTokenizer = struct {
                     result.tag = .string_literal;
                     continue :state .string_literal;
                 },
-                '0' ... '9' => {
+                '0' => {
+                    result.tag = .number_literal;
+                    continue :state .number_literal_zero;
+                },
+                '1'...'9' => {
                     result.tag = .number_literal;
                     continue :state .number_literal;
                 },
@@ -129,6 +141,9 @@ pub const GYulTokenizer = struct {
                     continue :state .identifier;
                 },
                 '/' => continue :state .slash,
+                ':' => continue :state .colon,
+                '-' => continue :state .minus,
+                ',' => { self.index += 1; result.tag = .comma; },
                 '(' => { self.index += 1; result.tag = .parenthesis_l; },
                 ')' => { self.index += 1; result.tag = .parenthesis_r; },
                 '[' => { self.index += 1; result.tag = .bracket_l; },
@@ -166,10 +181,28 @@ pub const GYulTokenizer = struct {
                     else => continue :state .string_literal,
                 }
             },
+            .number_literal_zero => {
+                self.index += 1;
+                switch (self.buffer[self.index]) {
+                    'x', 'X' => {
+                        result.tag = .hex_number_literal;
+                        continue :state .hex_number_literal;
+                    },
+                    '0'...'9' => continue :state .number_literal,
+                    else => {},
+                }
+            },
             .number_literal => {
                 self.index += 1;
                 switch (self.buffer[self.index]) {
                     '0'...'9' => continue :state .number_literal,
+                    else => {},
+                }
+            },
+            .hex_number_literal => {
+                self.index += 1;
+                switch (self.buffer[self.index]) {
+                    '0'...'9', 'a'...'f', 'A'...'F' => continue :state .hex_number_literal,
                     else => {},
                 }
             },
@@ -203,7 +236,27 @@ pub const GYulTokenizer = struct {
                         result.tag = .comment_multi_line;
                         continue :state .comment_multi_line;
                     },
-                    else => {}
+                    else => {},
+                }
+            },
+            .colon => {
+                self.index += 1;
+                switch (self.buffer[self.index]) {
+                    '=' => {
+                        self.index += 1;
+                        result.tag = .colon_assign;
+                    },
+                    else => result.tag = .invalid,
+                }
+            },
+            .minus => {
+                self.index += 1;
+                switch (self.buffer[self.index]) {
+                    '>' => {
+                        self.index += 1;
+                        result.tag = .arrow;
+                    },
+                    else => result.tag = .invalid,
                 }
             },
             .comment_single_line => {
