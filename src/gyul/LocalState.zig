@@ -22,6 +22,11 @@ variables: std.StringHashMapUnmanaged(u256),
 functions: std.StringHashMapUnmanaged(FunctionDef),
 parent: ?*Self,
 allocator: std.mem.Allocator,
+/// When true, variable lookup (get/set) does NOT walk past this scope.
+/// Function lookup still walks the parent chain. Used for function call
+/// scopes: per Yul spec, function bodies cannot access variables from
+/// enclosing scopes, only parameters, return vars, and sibling functions.
+is_function_boundary: bool,
 
 // ── Init / Deinit ────────────────────────────────────────────────────
 
@@ -31,6 +36,7 @@ pub fn init(allocator: std.mem.Allocator, parent: ?*Self) Self {
         .functions = .{},
         .parent = parent,
         .allocator = allocator,
+        .is_function_boundary = false,
     };
 }
 
@@ -47,19 +53,23 @@ pub fn declareVariable(self: *Self, name: []const u8, value: u256) !void {
 }
 
 /// Look up a variable, walking the scope chain.
+/// Stops at function boundaries (is_function_boundary).
 pub fn getVariable(self: *const Self, name: []const u8) ?u256 {
     if (self.variables.get(name)) |v| return v;
+    if (self.is_function_boundary) return null;
     if (self.parent) |p| return p.getVariable(name);
     return null;
 }
 
 /// Update an existing variable in the nearest enclosing scope that declares it.
 /// Returns false if the variable is not found in any scope.
+/// Stops at function boundaries (is_function_boundary).
 pub fn setVariable(self: *Self, name: []const u8, value: u256) bool {
     if (self.variables.getPtr(name)) |ptr| {
         ptr.* = value;
         return true;
     }
+    if (self.is_function_boundary) return false;
     if (self.parent) |p| return p.setVariable(name, value);
     return false;
 }
