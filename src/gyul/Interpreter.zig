@@ -104,6 +104,14 @@ const BuiltinTag = enum {
     mstore8,
     mload,
     msize,
+    // Logging
+    log0,
+    log1,
+    log2,
+    log3,
+    log4,
+    // Memory copy
+    mcopy,
     // Misc
     pop,
     calldataload,
@@ -144,6 +152,12 @@ const builtin_map = std.StaticStringMap(BuiltinTag).initComptime(.{
     .{ "mstore8", .mstore8 },
     .{ "mload", .mload },
     .{ "msize", .msize },
+    .{ "log0", .log0 },
+    .{ "log1", .log1 },
+    .{ "log2", .log2 },
+    .{ "log3", .log3 },
+    .{ "log4", .log4 },
+    .{ "mcopy", .mcopy },
     .{ "pop", .pop },
     .{ "calldataload", .calldataload },
     .{ "calldatasize", .calldatasize },
@@ -613,6 +627,23 @@ fn evalBuiltin(self: *Self, tag: BuiltinTag, args: []const u256) InterpreterErro
         },
         .mload => .{ .single = self.global.memLoad(args[0]) catch return error.OutOfMemory },
         .msize => .{ .single = self.global.getMsize() },
+        // Logging
+        .log0, .log1, .log2, .log3, .log4 => {
+            const num_topics: usize = @intFromEnum(tag) - @intFromEnum(BuiltinTag.log0);
+            const offset = args[0];
+            const len = args[1];
+            const size: usize = if (len > 4096) 4096 else @intCast(len);
+            const data = try self.allocator.alloc(u8, size);
+            defer self.allocator.free(data);
+            self.global.memRead(offset, data);
+            self.global.addLog(offset, len, data, args[2..][0..num_topics]) catch return error.OutOfMemory;
+            return .none;
+        },
+        // Memory copy
+        .mcopy => {
+            self.global.memCopy(args[0], args[1], args[2]) catch return error.OutOfMemory;
+            return .none;
+        },
         // Misc
         .pop => .none,
         .calldataload => blk: {
