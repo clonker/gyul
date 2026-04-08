@@ -9,4 +9,5 @@ test {
     _ = AST;
     _ = @import("Parser.zig");
     _ = @import("ASTPrinter.zig");
+    _ = @import("YulGen.zig");
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 const tokenizer = @import("tokenizer.zig");
 const Parser = @import("Parser.zig");
 const Printer = @import("ASTPrinter.zig");
+const YulGen = @import("YulGen.zig");
 
 const Self = @This();
 
@@ -126,6 +127,7 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) !Self {
         .token_tags = tokens.items(.tag),
         .token_starts = tokens.items(.start),
         .tok_i = 0,
+        .depth = 0,
         .errors = .{},
         .nodes = .{},
         .extra = .{},
@@ -310,7 +312,7 @@ test "parse error: missing closing brace" {
     try expectParseError("{ let x := 1");
 }
 
-test "fuzz parser" {
+test "fuzz parser raw bytes" {
     const Ctx = struct {
         fn run(_: @This(), input: []const u8) anyerror!void {
             const alloc = std.testing.allocator;
@@ -321,7 +323,6 @@ test "fuzz parser" {
             var ast = Self.parse(alloc, source) catch return;
             defer ast.deinit(alloc);
 
-            // If it parsed, printing must not crash
             const printed = ast.print(alloc) catch return;
             alloc.free(printed);
         }
@@ -333,9 +334,11 @@ test "fuzz round trip" {
     const Ctx = struct {
         fn run(_: @This(), input: []const u8) anyerror!void {
             const alloc = std.testing.allocator;
-            const source = try alloc.allocSentinel(u8, input.len, 0);
-            defer alloc.free(source);
-            @memcpy(source[0..input.len], input);
+
+            // Use entropy to generate valid Yul
+            var gen = YulGen.init(alloc, input);
+            defer gen.deinit();
+            const source = gen.generate() catch return;
 
             // First parse
             var ast1 = Self.parse(alloc, source) catch return;
@@ -370,9 +373,11 @@ test "fuzz differential" {
     const Ctx = struct {
         fn run(_: @This(), input: []const u8) anyerror!void {
             const alloc = std.testing.allocator;
-            const source = try alloc.allocSentinel(u8, input.len, 0);
-            defer alloc.free(source);
-            @memcpy(source[0..input.len], input);
+
+            // Use entropy to generate valid Yul
+            var gen = YulGen.init(alloc, input);
+            defer gen.deinit();
+            const source = gen.generate() catch return;
 
             // A = gyul parse + print
             var ast1 = Self.parse(alloc, source) catch return;

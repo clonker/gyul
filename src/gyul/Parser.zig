@@ -6,11 +6,14 @@ const Parser = @This();
 
 pub const Error = error{ParseError} || std.mem.Allocator.Error;
 
+const max_nesting_depth = 256;
+
 gpa: std.mem.Allocator,
 source: [:0]const u8,
 token_tags: []const tokenizer.Tag,
 token_starts: []const ast.ByteOffset,
 tok_i: ast.TokenIndex,
+depth: u16,
 errors: std.ArrayListUnmanaged(ast.Error),
 nodes: std.ArrayListUnmanaged(ast.Node),
 extra: std.ArrayListUnmanaged(ast.NodeIndex),
@@ -63,6 +66,13 @@ fn parseStatement(self: *Parser) Error!ast.NodeIndex {
 }
 
 fn parseBlock(self: *Parser) Error!ast.NodeIndex {
+    if (self.depth >= max_nesting_depth) return self.failMsg(.{
+        .tag = .expected_statement,
+        .token = self.tok_i,
+    });
+    self.depth += 1;
+    defer self.depth -= 1;
+
     self.eatComments();
     const lbrace = try self.expectToken(.brace_l);
 
