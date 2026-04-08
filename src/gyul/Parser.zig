@@ -32,14 +32,6 @@ const Members = struct {
     }
 };
 
-fn listToSpan(p: *Parser, list: []const ast.Node.Index) !ast.Node.SubRange {
-    try p.extra_data.appendSlice(p.gpa, list);
-    return ast.Node.SubRange{
-        .start = @as(ast.Node.Index, @intCast(p.extra_data.items.len - list.len)),
-        .end = @as(ast.Node.Index, @intCast(p.extra_data.items.len)),
-    };
-}
-
 pub fn deinit(self: *Parser) void {
     self.nodes.deinit(self.gpa);
     self.extra_data.deinit(self.gpa);
@@ -47,25 +39,68 @@ pub fn deinit(self: *Parser) void {
 }
 
 pub fn parseRoot(self: *Parser) !void {
-    eatDocs(self);
+    self.eatComments();
     _ = try expectToken(self, .brace_l);
     try self.nodes.append(self.gpa, .{
         .tag = .root,
         .data = undefined,
     });
-    // const root_members = try self.parseContainerMembers();
-    // const root_decls = try root_members.toSpan(self);
-    //if (self.token_tags[self.tok_i] != .eof) {
-    //    try self.warnExpected(.eof);
-    //}
-    //self.nodes.items(.data)[0] = .{
-    //    .lhs = root_decls.start,
-    //    .rhs = root_decls.end,
-    //};
+
+    // Skip body tokens until closing brace
+    // TODO: replace with proper member/statement parsing
+    while (self.tok_i < self.token_tags.len and self.token_tags[self.tok_i] != .brace_r) {
+        _ = self.nextToken();
+    }
+
     _ = try expectToken(self, .brace_r);
 }
 
-fn eatDocs(self: *Parser) void {
+fn parseBlock(self: *Parser) Error!ast.Node.Index {
+    self.eatComments();
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+    _ = try self.expectToken(.brace_l);
+    while (true) {
+        if (self.tok_i >= self.token_tags.len or self.token_tags[self.tok_i] == .brace_r) break;
+        const statement = try self.parseStatement();
+        if (statement == 0) break;
+        try self.scratch.append(self.gpa, statement);
+    }
+    _ = try self.expectToken(.brace_r);
+    const statements = self.scratch.items[scratch_top..];
+    return switch (statements.len) {
+        0 => try self.addNode(.{
+            .tag = .block2,
+            .data = .{ .lhs = 0, .rhs = 0 },
+        }),
+        1 => try self.addNode(.{
+            .tag = .block2,
+            .data = .{ .lhs = statements[0], .rhs = 0 },
+        }),
+        2 => try self.addNode(.{
+            .tag = .block2,
+            .data = .{ .lhs = statements[0], .rhs = statements[1] },
+        }),
+        else => blk: {
+            const span = try self.listToSpan(statements);
+            break :blk try self.addNode(.{
+                .tag = .block,
+                .data = .{ .lhs = span.start, .rhs = span.end },
+            });
+        },
+    };
+}
+
+fn parseStatement(self: *Parser) Error!ast.Node.Index {
+    self.eatComments();
+    if (self.tok_i >= self.token_tags.len) return 0;
+    // TODO: implement statement parsing for each keyword
+    // For now, skip tokens until we hit a closing brace or EOF
+    _ = self.nextToken();
+    return 0;
+}
+
+fn eatComments(self: *Parser) void {
     while (
         self.tok_i < self.token_tags.len and
         (self.token_tags[self.tok_i] == .comment_single_line or self.token_tags[self.tok_i] == .comment_multi_line)
@@ -115,4 +150,18 @@ fn warnMsg(p: *Parser, msg: ast.Error) error{OutOfMemory}!void {
         },
     }
     try p.errors.append(p.gpa, msg);
+}
+
+fn addNode(self: *Parser, elem: ast.Node) std.mem.Allocator.Error!ast.Node.Index {
+    const result = @as(ast.Node.Index, @intCast(self.nodes.len));
+    try self.nodes.append(self.gpa, elem);
+    return result;
+}
+
+fn listToSpan(self: *Parser, list: []const ast.Node.Index) !ast.Node.SubRange {
+    try self.extra_data.appendSlice(self.gpa, list);
+    return ast.Node.SubRange{
+        .start = @as(ast.Node.Index, @intCast(self.extra_data.items.len - list.len)),
+        .end = @as(ast.Node.Index, @intCast(self.extra_data.items.len)),
+    };
 }

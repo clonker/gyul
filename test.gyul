@@ -1,4 +1,7 @@
-"argh" fot for fore /* inline comment */ hello while "blah" "oof" 999
+"a\\nr\"gh" 
+
+
+fot for fore /* inline comment */ hello while "blah" "oof" 999
 for
 fn  // this is a comment
 end
@@ -9,3 +12,5 @@ end
  */ for
 
  ((){}[])
+
+/*

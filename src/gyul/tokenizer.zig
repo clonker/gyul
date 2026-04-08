@@ -169,10 +169,7 @@ pub const GYulTokenizer = struct {
             .number_literal => {
                 self.index += 1;
                 switch (self.buffer[self.index]) {
-                    '0' ... '9' => {
-                        self.index += 1;
-                        continue :state .number_literal;
-                    },
+                    '0'...'9' => continue :state .number_literal,
                     else => {},
                 }
             },

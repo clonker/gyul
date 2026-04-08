@@ -30,6 +30,8 @@ pub const Node = struct {
         root,
         ifStatement,
         forLoop,
+        block,
+        block2,
     };
 
     pub const Data = struct {
