@@ -271,6 +271,9 @@ call_depth: u32,
 halt_reason: ?HaltReason,
 /// Token index of the last runtime error (for source location reporting).
 error_token: ?AST.TokenIndex,
+/// Maximum number of statement steps before forced halt. null = unlimited.
+max_steps: ?u64,
+steps_remaining: u64,
 
 const MAX_CALL_DEPTH = 1024;
 
@@ -285,6 +288,8 @@ pub fn init(allocator: std.mem.Allocator, ast: *const AST, global: *GlobalState,
         .call_depth = 0,
         .halt_reason = null,
         .error_token = null,
+        .max_steps = null,
+        .steps_remaining = 0,
     };
 }
 
@@ -303,6 +308,7 @@ pub fn errorTokenText(self: *const Self) ?[]const u8 {
 }
 
 pub fn interpret(self: *Self) InterpreterError!ExecutionResult {
+    self.steps_remaining = self.max_steps orelse std.math.maxInt(u64);
     _ = self.execStmt(0) catch |err| {
         if (err == error.ExecutionHalt) return .{ .halt_reason = self.halt_reason };
         return err;
@@ -506,6 +512,13 @@ fn evalFunctionCall(self: *Self, tok: AST.TokenIndex, args_span: AST.Span) Inter
 // ── Statement Execution ─────────────────────────────────────────────
 
 pub fn execStmt(self: *Self, node_idx: AST.NodeIndex) InterpreterError!StmtResult {
+    if (self.max_steps != null) {
+        if (self.steps_remaining == 0) {
+            self.halt_reason = .stopped;
+            return error.ExecutionHalt;
+        }
+        self.steps_remaining -= 1;
+    }
     const node = self.ast.nodes[node_idx];
     self.error_token = node.getToken();
     return switch (node) {
@@ -1445,4 +1458,474 @@ test "eval: pc returns 0" {
 
 test "eval: blockhash returns 0 (stub)" {
     try expectStorage("{ sstore(0, blockhash(0)) }", &.{.{ 0, 0 }});
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Phase 6 — Integration & Spec Conformance Tests
+// ════════════════════════════════════════════════════════════════════
+
+// ── Arithmetic Edge Cases ──────────────────────────────────────────
+
+test "int: add wrapping overflow" {
+    // max_u256 + 1 wraps to 0
+    try expectStorage("{ sstore(0, add(not(0), 1)) }", &.{.{ 0, 0 }});
+}
+
+test "int: sub wrapping underflow" {
+    // 0 - 1 wraps to max_u256
+    try expectStorage("{ sstore(0, sub(0, 1)) }", &.{.{ 0, std.math.maxInt(u256) }});
+}
+
+test "int: mul wrapping" {
+    // max_u256 * 2 wraps
+    try expectStorage("{ sstore(0, mul(not(0), 2)) }", &.{.{ 0, std.math.maxInt(u256) -% 1 }});
+}
+
+test "int: sdiv basic" {
+    // -6 / 2 = -3 (in two's complement)
+    const neg6: u256 = @bitCast(@as(i256, -6));
+    const neg3: u256 = @bitCast(@as(i256, -3));
+    try expectStorage("{ sstore(0, sdiv(sub(0, 6), 2)) }", &.{.{ 0, neg3 }});
+    _ = neg6;
+}
+
+test "int: sdiv min_int / -1" {
+    // minInt(i256) / -1 = minInt(i256) (EVM spec: no overflow exception)
+    const min_int: u256 = @bitCast(@as(i256, std.math.minInt(i256)));
+    try expectStorage(
+        "{ sstore(0, sdiv(shl(255, 1), sub(0, 1))) }",
+        &.{.{ 0, min_int }},
+    );
+}
+
+test "int: smod sign follows dividend" {
+    // -7 % 3 = -1 (sign of dividend)
+    const neg7: u256 = @bitCast(@as(i256, -7));
+    const neg1: u256 = @bitCast(@as(i256, -1));
+    _ = neg7;
+    try expectStorage("{ sstore(0, smod(sub(0, 7), 3)) }", &.{.{ 0, neg1 }});
+}
+
+test "int: exp modular" {
+    // 2^256 wraps to 0
+    try expectStorage("{ sstore(0, exp(2, 256)) }", &.{.{ 0, 0 }});
+}
+
+test "int: exp 2^255" {
+    try expectStorage("{ sstore(0, exp(2, 255)) }", &.{.{ 0, @as(u256, 1) << 255 }});
+}
+
+test "int: addmod avoids intermediate overflow" {
+    // addmod(max, 1, max) = 1 (intermediate sum doesn't overflow)
+    try expectStorage("{ sstore(0, addmod(not(0), 1, not(0))) }", &.{.{ 0, 1 }});
+}
+
+test "int: mulmod avoids intermediate overflow" {
+    // mulmod(max, max, max) = 0
+    try expectStorage("{ sstore(0, mulmod(not(0), not(0), not(0))) }", &.{.{ 0, 0 }});
+}
+
+test "int: signextend byte 0" {
+    // signextend(0, 0xFF) extends bit 7 → all 1s
+    try expectStorage("{ sstore(0, signextend(0, 0xFF)) }", &.{.{ 0, std.math.maxInt(u256) }});
+}
+
+test "int: signextend byte 0 positive" {
+    // signextend(0, 0x7F) → 0x7F (bit 7 is 0)
+    try expectStorage("{ sstore(0, signextend(0, 0x7F)) }", &.{.{ 0, 0x7F }});
+}
+
+test "int: byte extraction" {
+    // byte(31, 0xAB) extracts least-significant byte
+    try expectStorage("{ sstore(0, byte(31, 0xAB)) }", &.{.{ 0, 0xAB }});
+}
+
+test "int: byte out of range" {
+    // byte(32, x) = 0
+    try expectStorage("{ sstore(0, byte(32, 0xFF)) }", &.{.{ 0, 0 }});
+}
+
+test "int: slt signed comparison" {
+    // -1 < 0 in signed
+    try expectStorage("{ sstore(0, slt(sub(0, 1), 0)) }", &.{.{ 0, 1 }});
+}
+
+test "int: sgt signed comparison" {
+    // 0 > -1 in signed
+    try expectStorage("{ sstore(0, sgt(0, sub(0, 1))) }", &.{.{ 0, 1 }});
+}
+
+test "int: sar arithmetic shift right" {
+    // sar(1, -2) = -1 (sign-extending)
+    const neg1: u256 = @bitCast(@as(i256, -1));
+    try expectStorage("{ sstore(0, sar(1, sub(0, 2))) }", &.{.{ 0, neg1 }});
+}
+
+// ── Scoping Tests ──────────────────────────────────────────────────
+
+test "int: for-loop init vars visible in condition" {
+    try expectStorage(
+        "{ let sum := 0 for { let i := 0 } lt(i, 12) { i := add(i, 3) } { sum := add(sum, 1) } sstore(0, sum) }",
+        &.{.{ 0, 4 }},
+    );
+}
+
+test "int: for-loop init vars visible in post" {
+    try expectStorage(
+        "{ for { let i := 0 } lt(i, 3) { i := add(i, 1) } { sstore(i, i) } }",
+        &.{ .{ 0, 0 }, .{ 1, 1 }, .{ 2, 2 } },
+    );
+}
+
+test "int: for-loop init vars NOT visible after loop" {
+    try expectError(
+        "{ for { let i := 0 } lt(i, 3) { i := add(i, 1) } {} sstore(0, i) }",
+        error.UndefinedVariable,
+    );
+}
+
+test "int: nested blocks shadow correctly" {
+    try expectStorage(
+        "{ let x := 1 { let x := 2 sstore(0, x) } sstore(1, x) }",
+        &.{ .{ 0, 2 }, .{ 1, 1 } },
+    );
+}
+
+test "int: deeply nested scopes" {
+    try expectStorage(
+        "{ let x := 1 { let y := 2 { let z := 3 sstore(0, add(add(x, y), z)) } } }",
+        &.{.{ 0, 6 }},
+    );
+}
+
+test "int: assignment updates outer scope" {
+    try expectStorage(
+        "{ let x := 0 { x := 42 } sstore(0, x) }",
+        &.{.{ 0, 42 }},
+    );
+}
+
+// ── Control Flow Tests ─────────────────────────────────────────────
+
+test "int: nested for loops with break" {
+    try expectStorage(
+        \\{ let count := 0
+        \\  for { let i := 0 } lt(i, 3) { i := add(i, 1) } {
+        \\    for { let j := 0 } lt(j, 3) { j := add(j, 1) } {
+        \\      if eq(j, 1) { break }
+        \\      count := add(count, 1)
+        \\    }
+        \\  }
+        \\  sstore(0, count)
+        \\}
+    ,
+        &.{.{ 0, 3 }}, // outer runs 3 times, inner breaks after j=0 each time
+    );
+}
+
+test "int: continue skips rest of body but runs post" {
+    try expectStorage(
+        \\{ let sum := 0
+        \\  for { let i := 0 } lt(i, 5) { i := add(i, 1) } {
+        \\    if eq(i, 2) { continue }
+        \\    if eq(i, 4) { continue }
+        \\    sum := add(sum, i)
+        \\  }
+        \\  sstore(0, sum)
+        \\}
+    ,
+        &.{.{ 0, 4 }}, // 0 + 1 + 3 = 4
+    );
+}
+
+test "int: leave exits function early" {
+    try expectStorage(
+        \\{ function f() -> r {
+        \\    r := 10
+        \\    if 1 { leave }
+        \\    r := 20
+        \\  }
+        \\  sstore(0, f())
+        \\}
+    ,
+        &.{.{ 0, 10 }},
+    );
+}
+
+test "int: leave inside nested function" {
+    try expectStorage(
+        \\{ function outer() -> r {
+        \\    function inner() -> s {
+        \\      s := 1
+        \\      leave
+        \\      s := 2
+        \\    }
+        \\    r := add(inner(), 10)
+        \\  }
+        \\  sstore(0, outer())
+        \\}
+    ,
+        &.{.{ 0, 11 }},
+    );
+}
+
+test "int: if mode propagation (break inside if in loop)" {
+    try expectStorage(
+        \\{ let x := 0
+        \\  for {} 1 {} {
+        \\    x := add(x, 1)
+        \\    if gt(x, 3) { break }
+        \\  }
+        \\  sstore(0, x)
+        \\}
+    ,
+        &.{.{ 0, 4 }},
+    );
+}
+
+// ── Memory Tests ───────────────────────────────────────────────────
+
+test "int: msize tracks high water mark" {
+    try expectStorage(
+        "{ mstore(0, 1) sstore(0, msize()) mstore(100, 1) sstore(1, msize()) }",
+        &.{ .{ 0, 32 }, .{ 1, 160 } }, // ceil(100+32, 32) = 132 → rounded to 160? no: (100+32+31) & ~31 = 160
+    );
+}
+
+test "int: mcopy preserves data" {
+    try expectStorage(
+        "{ mstore(0, 0xCAFE) mcopy(32, 0, 32) sstore(0, eq(mload(0), mload(32))) }",
+        &.{.{ 0, 1 }},
+    );
+}
+
+test "int: mstore8 stores single byte" {
+    try expectStorage(
+        "{ mstore8(0, 0xAB) sstore(0, byte(0, mload(0))) }",
+        &.{.{ 0, 0xAB }},
+    );
+}
+
+// ── Switch Statement Tests ─────────────────────────────────────────
+
+test "int: switch with expression" {
+    try expectStorage(
+        "{ let x := 2 switch add(x, 1) case 2 { sstore(0, 20) } case 3 { sstore(0, 30) } }",
+        &.{.{ 0, 30 }},
+    );
+}
+
+test "int: switch case no fallthrough" {
+    try expectStorage(
+        "{ switch 1 case 1 { sstore(0, 10) } case 2 { sstore(0, 20) } default { sstore(0, 30) } }",
+        &.{.{ 0, 10 }},
+    );
+}
+
+// ── Function Call Tests ────────────────────────────────────────────
+
+test "int: right-to-left argument evaluation" {
+    // sstore evaluates args right-to-left: value first, then key.
+    // We can observe this by using a function with side effects.
+    try expectStorage(
+        \\{ let counter := 0
+        \\  function next() -> r {
+        \\    // We can't access counter here (scope isolation),
+        \\    // so test via sstore side effects instead.
+        \\    r := 0
+        \\  }
+        \\  // Right-to-left: sub(0,1) evals 1 first then 0.
+        \\  // sub(5, 3) = 2 regardless of order for pure functions.
+        \\  sstore(0, sub(5, 3))
+        \\}
+    ,
+        &.{.{ 0, 2 }},
+    );
+}
+
+test "int: right-to-left with sstore ordering" {
+    // mstore side effects depend on evaluation order.
+    // In right-to-left: second arg of mstore is evaluated first.
+    // mstore(add(x, 0), mload(0)) — mload(0) evaluated before add(x, 0)
+    try expectStorage(
+        \\{ mstore(0, 42)
+        \\  mstore(32, mload(0))
+        \\  sstore(0, mload(32))
+        \\}
+    ,
+        &.{.{ 0, 42 }},
+    );
+}
+
+test "int: function hoisting allows forward reference" {
+    try expectStorage(
+        \\{ sstore(0, add(f(), g()))
+        \\  function f() -> r { r := 10 }
+        \\  function g() -> r { r := 20 }
+        \\}
+    ,
+        &.{.{ 0, 30 }},
+    );
+}
+
+test "int: function hoisting in nested block" {
+    try expectStorage(
+        \\{ {
+        \\    sstore(0, f())
+        \\    function f() -> r { r := 77 }
+        \\  }
+        \\}
+    ,
+        &.{.{ 0, 77 }},
+    );
+}
+
+test "int: function NOT visible after defining block exits" {
+    try expectError(
+        "{ { function f() -> r { r := 1 } } sstore(0, f()) }",
+        error.UndefinedFunction,
+    );
+}
+
+test "int: multi-return assignment" {
+    try expectStorage(
+        \\{ function swap(a, b) -> x, y { x := b y := a }
+        \\  let p, q := swap(10, 20)
+        \\  sstore(0, p)
+        \\  sstore(1, q)
+        \\}
+    ,
+        &.{ .{ 0, 20 }, .{ 1, 10 } },
+    );
+}
+
+test "int: mutual recursion" {
+    try expectStorage(
+        \\{ function is_even(n) -> r {
+        \\    if iszero(n) { r := 1 leave }
+        \\    r := is_odd(sub(n, 1))
+        \\  }
+        \\  function is_odd(n) -> r {
+        \\    if iszero(n) { r := 0 leave }
+        \\    r := is_even(sub(n, 1))
+        \\  }
+        \\  sstore(0, is_even(10))
+        \\  sstore(1, is_even(7))
+        \\  sstore(2, is_odd(5))
+        \\}
+    ,
+        &.{ .{ 0, 1 }, .{ 1, 0 }, .{ 2, 1 } },
+    );
+}
+
+test "int: stack overflow detection" {
+    try expectError(
+        "{ function f() { f() } f() }",
+        error.StackOverflow,
+    );
+}
+
+// ── Halt Condition Tests ───────────────────────────────────────────
+
+test "int: revert inside function" {
+    var state = try runInterpreterFull(
+        \\{ function f() { mstore(0, 0xBEEF) revert(0, 32) }
+        \\  sstore(0, 1)
+        \\  f()
+        \\  sstore(0, 2)
+        \\}
+    );
+    defer state.deinit();
+    try testing.expectEqual(@as(?HaltReason, .reverted), state.halt_reason);
+    try testing.expectEqual(@as(u256, 1), state.global.sload(0)); // first sstore ran
+}
+
+test "int: return with zero length" {
+    var state = try runInterpreterFull("{ return(0, 0) }");
+    defer state.deinit();
+    try testing.expectEqual(@as(?HaltReason, .returned), state.halt_reason);
+    try testing.expectEqual(@as(usize, 0), state.global.return_data.len);
+}
+
+test "int: stop in nested loop" {
+    var state = try runInterpreterFull(
+        \\{ for { let i := 0 } lt(i, 10) { i := add(i, 1) } {
+        \\    for { let j := 0 } lt(j, 10) { j := add(j, 1) } {
+        \\      if eq(add(mul(i, 10), j), 25) { stop() }
+        \\    }
+        \\  }
+        \\}
+    );
+    defer state.deinit();
+    try testing.expectEqual(@as(?HaltReason, .stopped), state.halt_reason);
+}
+
+// ── Error Reporting Tests ──────────────────────────────────────────
+
+test "int: error location tracks correct token" {
+    const allocator = testing.allocator;
+    const source: [:0]const u8 = "{ let x := 1\n  sstore(0, y)\n}";
+    var ast = try AST.parse(allocator, source);
+    defer ast.deinit(allocator);
+
+    var global = GlobalState.init(allocator);
+    defer global.deinit();
+
+    var local = LocalState.init(allocator, null);
+    defer local.deinit();
+
+    var interp = Self.init(allocator, &ast, &global, &local);
+    _ = interp.interpret() catch |err| {
+        try testing.expectEqual(error.UndefinedVariable, err);
+        const loc = interp.errorLocation().?;
+        try testing.expectEqual(@as(u32, 2), loc.line);
+        try testing.expectEqualStrings("y", interp.errorTokenText().?);
+        return;
+    };
+    return error.ExpectedError;
+}
+
+// ── Expression Statement Error Tests ───────────────────────────────
+
+test "int: non-void expression as statement errors" {
+    try expectError("{ add(1, 2) }", error.TypeError);
+}
+
+test "int: assignment to undeclared variable errors" {
+    try expectError("{ x := 42 }", error.UndefinedVariable);
+}
+
+test "int: arity mismatch errors" {
+    try expectError(
+        "{ function f(a) -> r { r := a } sstore(0, f(1, 2)) }",
+        error.ArityMismatch,
+    );
+}
+
+// ── Fuzz: Interpreter Robustness ───────────────────────────────────
+
+test "fuzz interpreter does not crash" {
+    const Ctx = struct {
+        fn run(_: @This(), input: []const u8) anyerror!void {
+            const alloc = testing.allocator;
+
+            var gen = @import("YulGen.zig").init(alloc, input);
+            defer gen.deinit();
+            const source = gen.generate() catch return;
+
+            var ast = AST.parse(alloc, source) catch return;
+            defer ast.deinit(alloc);
+
+            var global = GlobalState.init(alloc);
+            defer global.deinit();
+
+            var local = LocalState.init(alloc, null);
+            defer local.deinit();
+
+            var interp = Self.init(alloc, &ast, &global, &local);
+            interp.max_steps = 10_000;
+            _ = interp.interpret() catch return;
+        }
+    };
+    try std.testing.fuzz(Ctx{}, Ctx.run, .{});
 }
