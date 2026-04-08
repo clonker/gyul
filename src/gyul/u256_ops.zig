@@ -162,6 +162,10 @@ pub fn iszero(x: u256) u256 {
     return if (x == 0) 1 else 0;
 }
 
+pub fn clz_(x: u256) u256 {
+    return @clz(x);
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;

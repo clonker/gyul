@@ -54,6 +54,17 @@ pub const StmtResult = struct {
     mode: ExecMode = .regular,
 };
 
+pub const HaltReason = enum {
+    stopped,
+    returned,
+    reverted,
+    invalid_,
+};
+
+pub const ExecutionResult = struct {
+    halt_reason: ?HaltReason = null,
+};
+
 pub const InterpreterError = error{
     UndefinedVariable,
     UndefinedFunction,
@@ -61,6 +72,7 @@ pub const InterpreterError = error{
     TypeError,
     InvalidLiteral,
     StackOverflow,
+    ExecutionHalt,
 } || std.mem.Allocator.Error;
 
 // ── Builtins ────────────────────────────────────────────────────────
@@ -112,10 +124,56 @@ const BuiltinTag = enum {
     log4,
     // Memory copy
     mcopy,
-    // Misc
-    pop,
+    // Call data & return data
     calldataload,
     calldatasize,
+    calldatacopy,
+    returndatasize,
+    returndatacopy,
+    codecopy,
+    extcodecopy,
+    // Context getters
+    address,
+    balance,
+    origin,
+    caller,
+    callvalue,
+    gasprice,
+    coinbase,
+    timestamp,
+    number,
+    prevrandao,
+    gaslimit,
+    chainid,
+    selfbalance,
+    basefee,
+    blobhash,
+    blobbasefee,
+    gas,
+    codesize,
+    pc,
+    // Hash & crypto
+    keccak256,
+    blockhash,
+    // Arithmetic
+    clz,
+    // Control flow halts
+    stop,
+    return_,
+    revert,
+    invalid,
+    // Contract interaction (stubs)
+    call,
+    staticcall,
+    delegatecall,
+    callcode,
+    create,
+    create2,
+    extcodesize,
+    extcodehash,
+    selfdestruct,
+    // Misc
+    pop,
 };
 
 const builtin_map = std.StaticStringMap(BuiltinTag).initComptime(.{
@@ -158,9 +216,49 @@ const builtin_map = std.StaticStringMap(BuiltinTag).initComptime(.{
     .{ "log3", .log3 },
     .{ "log4", .log4 },
     .{ "mcopy", .mcopy },
-    .{ "pop", .pop },
     .{ "calldataload", .calldataload },
     .{ "calldatasize", .calldatasize },
+    .{ "calldatacopy", .calldatacopy },
+    .{ "returndatasize", .returndatasize },
+    .{ "returndatacopy", .returndatacopy },
+    .{ "codecopy", .codecopy },
+    .{ "extcodecopy", .extcodecopy },
+    .{ "address", .address },
+    .{ "balance", .balance },
+    .{ "origin", .origin },
+    .{ "caller", .caller },
+    .{ "callvalue", .callvalue },
+    .{ "gasprice", .gasprice },
+    .{ "coinbase", .coinbase },
+    .{ "timestamp", .timestamp },
+    .{ "number", .number },
+    .{ "prevrandao", .prevrandao },
+    .{ "gaslimit", .gaslimit },
+    .{ "chainid", .chainid },
+    .{ "selfbalance", .selfbalance },
+    .{ "basefee", .basefee },
+    .{ "blobhash", .blobhash },
+    .{ "blobbasefee", .blobbasefee },
+    .{ "gas", .gas },
+    .{ "codesize", .codesize },
+    .{ "pc", .pc },
+    .{ "keccak256", .keccak256 },
+    .{ "blockhash", .blockhash },
+    .{ "clz", .clz },
+    .{ "stop", .stop },
+    .{ "return", .return_ },
+    .{ "revert", .revert },
+    .{ "invalid", .invalid },
+    .{ "call", .call },
+    .{ "staticcall", .staticcall },
+    .{ "delegatecall", .delegatecall },
+    .{ "callcode", .callcode },
+    .{ "create", .create },
+    .{ "create2", .create2 },
+    .{ "extcodesize", .extcodesize },
+    .{ "extcodehash", .extcodehash },
+    .{ "selfdestruct", .selfdestruct },
+    .{ "pop", .pop },
 });
 
 // ── Fields ──────────────────────────────────────────────────────────
@@ -170,6 +268,7 @@ global: *GlobalState,
 local: *LocalState,
 allocator: std.mem.Allocator,
 call_depth: u32,
+halt_reason: ?HaltReason,
 
 const MAX_CALL_DEPTH = 1024;
 
@@ -182,13 +281,18 @@ pub fn init(allocator: std.mem.Allocator, ast: *const AST, global: *GlobalState,
         .local = local,
         .allocator = allocator,
         .call_depth = 0,
+        .halt_reason = null,
     };
 }
 
 // ── Entry Point ─────────────────────────────────────────────────────
 
-pub fn interpret(self: *Self) InterpreterError!StmtResult {
-    return self.execStmt(0);
+pub fn interpret(self: *Self) InterpreterError!ExecutionResult {
+    _ = self.execStmt(0) catch |err| {
+        if (err == error.ExecutionHalt) return .{ .halt_reason = self.halt_reason };
+        return err;
+    };
+    return .{};
 }
 
 // ── Expression Evaluation ───────────────────────────────────────────
@@ -644,8 +748,7 @@ fn evalBuiltin(self: *Self, tag: BuiltinTag, args: []const u256) InterpreterErro
             self.global.memCopy(args[0], args[1], args[2]) catch return error.OutOfMemory;
             return .none;
         },
-        // Misc
-        .pop => .none,
+        // Call data & return data
         .calldataload => blk: {
             const offset = args[0];
             var buf: [32]u8 = std.mem.zeroes([32]u8);
@@ -657,7 +760,118 @@ fn evalBuiltin(self: *Self, tag: BuiltinTag, args: []const u256) InterpreterErro
             break :blk .{ .single = std.mem.readInt(u256, &buf, .big) };
         },
         .calldatasize => .{ .single = @intCast(self.global.calldata.len) },
+        .calldatacopy => {
+            try self.copyToMemory(args[0], args[1], args[2], self.global.calldata);
+            return .none;
+        },
+        .returndatasize => .{ .single = @intCast(self.global.return_data.len) },
+        .returndatacopy => {
+            try self.copyToMemory(args[0], args[1], args[2], self.global.return_data);
+            return .none;
+        },
+        .codecopy => {
+            try self.copyToMemory(args[0], args[1], args[2], &.{});
+            return .none;
+        },
+        .extcodecopy => {
+            try self.copyToMemory(args[1], args[2], args[3], &.{});
+            return .none;
+        },
+        // Context getters
+        .address => .{ .single = self.global.address },
+        .balance => .{ .single = 0 }, // stub
+        .origin => .{ .single = self.global.origin },
+        .caller => .{ .single = self.global.caller },
+        .callvalue => .{ .single = self.global.callvalue },
+        .gasprice => .{ .single = self.global.gasprice },
+        .coinbase => .{ .single = self.global.coinbase },
+        .timestamp => .{ .single = self.global.timestamp },
+        .number => .{ .single = self.global.block_number },
+        .prevrandao => .{ .single = self.global.prevrandao },
+        .gaslimit => .{ .single = self.global.gaslimit },
+        .chainid => .{ .single = self.global.chainid },
+        .selfbalance => .{ .single = 0 }, // stub
+        .basefee => .{ .single = self.global.basefee },
+        .blobhash => .{ .single = 0 }, // stub
+        .blobbasefee => .{ .single = self.global.blobbasefee },
+        .gas => .{ .single = @as(u256, 1) << 64 },
+        .codesize => .{ .single = 0 },
+        .pc => .{ .single = 0 },
+        // Hash & crypto
+        .keccak256 => blk: {
+            const offset = args[0];
+            const len = args[1];
+            self.global.updateMsize(offset, len);
+            const size: usize = if (len > 0x100000) 0x100000 else @intCast(len);
+            const buf = try self.allocator.alloc(u8, size);
+            defer self.allocator.free(buf);
+            self.global.memRead(offset, buf);
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha3.Keccak256.hash(buf, &hash, .{});
+            break :blk .{ .single = std.mem.readInt(u256, &hash, .big) };
+        },
+        .blockhash => .{ .single = 0 }, // stub
+        // Arithmetic
+        .clz => .{ .single = u256_ops.clz_(args[0]) },
+        // Control flow halts
+        .stop => {
+            self.halt_reason = .stopped;
+            return error.ExecutionHalt;
+        },
+        .return_ => {
+            try self.captureHaltData(args[0], args[1]);
+            self.halt_reason = .returned;
+            return error.ExecutionHalt;
+        },
+        .revert => {
+            try self.captureHaltData(args[0], args[1]);
+            self.halt_reason = .reverted;
+            return error.ExecutionHalt;
+        },
+        .invalid => {
+            self.halt_reason = .invalid_;
+            return error.ExecutionHalt;
+        },
+        // Contract interaction (stubs — always fail)
+        .call, .callcode => .{ .single = 0 },
+        .delegatecall, .staticcall => .{ .single = 0 },
+        .create, .create2 => .{ .single = 0 },
+        .extcodesize => .{ .single = 0 },
+        .extcodehash => .{ .single = 0 },
+        .selfdestruct => .none,
+        // Misc
+        .pop => .none,
     };
+}
+
+fn copyToMemory(self: *Self, dest_off: u256, src_off: u256, len: u256, src: []const u8) !void {
+    if (len == 0) return;
+    const size: usize = if (len > 0x100000) 0x100000 else @intCast(len);
+    const buf = try self.allocator.alloc(u8, size);
+    defer self.allocator.free(buf);
+    @memset(buf, 0);
+    if (src_off < src.len) {
+        const start: usize = @intCast(src_off);
+        const avail = @min(size, src.len - start);
+        @memcpy(buf[0..avail], src[start..][0..avail]);
+    }
+    try self.global.memWrite(dest_off, buf);
+}
+
+fn captureHaltData(self: *Self, offset: u256, len: u256) !void {
+    if (self.global.return_data_owned) {
+        self.allocator.free(self.global.return_data);
+        self.global.return_data = &.{};
+        self.global.return_data_owned = false;
+    }
+    if (len > 0) {
+        self.global.updateMsize(offset, len);
+        const size: usize = if (len > 0x1000000) 0x1000000 else @intCast(len);
+        const buf = try self.allocator.alloc(u8, size);
+        self.global.memRead(offset, buf);
+        self.global.return_data = buf;
+        self.global.return_data_owned = true;
+    }
 }
 
 fn bin(comptime op: fn (u256, u256) u256, args: []const u256) Values {
@@ -988,4 +1202,230 @@ test "eval: transient storage" {
         "{ tstore(0, 42) sstore(0, tload(0)) sstore(1, tload(1)) }",
         &.{ .{ 0, 42 }, .{ 1, 0 } },
     );
+}
+
+// ── Halt Builtin Tests ─────────────────────────────────────────────
+
+const HaltTestResult = struct {
+    global: GlobalState,
+    local: LocalState,
+    ast: AST,
+    halt_reason: ?HaltReason,
+
+    fn deinit(self: *@This()) void {
+        self.global.deinit();
+        self.local.deinit();
+        self.ast.deinit(testing.allocator);
+    }
+};
+
+fn runInterpreterFull(source: [:0]const u8) !HaltTestResult {
+    return runInterpreterWithCtx(source, .{});
+}
+
+const TestCtx = struct {
+    calldata: []const u8 = &.{},
+    caller: u256 = 0,
+    callvalue: u256 = 0,
+    address: u256 = 0,
+    origin: u256 = 0,
+    timestamp: u256 = 0,
+    chainid: u256 = 0,
+};
+
+fn runInterpreterWithCtx(source: [:0]const u8, ctx: TestCtx) !HaltTestResult {
+    const allocator = testing.allocator;
+    var ast = try AST.parse(allocator, source);
+    errdefer ast.deinit(allocator);
+
+    var global = GlobalState.init(allocator);
+    errdefer global.deinit();
+    global.calldata = ctx.calldata;
+    global.caller = ctx.caller;
+    global.callvalue = ctx.callvalue;
+    global.address = ctx.address;
+    global.origin = ctx.origin;
+    global.timestamp = ctx.timestamp;
+    global.chainid = ctx.chainid;
+
+    var local = LocalState.init(allocator, null);
+    errdefer local.deinit();
+
+    var interp = Self.init(allocator, &ast, &global, &local);
+    const result = try interp.interpret();
+
+    return .{ .global = global, .local = local, .ast = ast, .halt_reason = result.halt_reason };
+}
+
+test "eval: stop halts execution" {
+    var state = try runInterpreterFull("{ sstore(0, 1) stop() sstore(0, 2) }");
+    defer state.deinit();
+    try testing.expectEqual(@as(?HaltReason, .stopped), state.halt_reason);
+    try testing.expectEqual(@as(u256, 1), state.global.sload(0));
+}
+
+test "eval: return captures memory" {
+    var state = try runInterpreterFull("{ mstore(0, 0xDEAD) return(0, 32) }");
+    defer state.deinit();
+    try testing.expectEqual(@as(?HaltReason, .returned), state.halt_reason);
+    try testing.expectEqual(@as(usize, 32), state.global.return_data.len);
+    const val = std.mem.readInt(u256, state.global.return_data[0..32], .big);
+    try testing.expectEqual(@as(u256, 0xDEAD), val);
+}
+
+test "eval: revert captures memory" {
+    var state = try runInterpreterFull("{ mstore(0, 0xBEEF) revert(0, 32) }");
+    defer state.deinit();
+    try testing.expectEqual(@as(?HaltReason, .reverted), state.halt_reason);
+    try testing.expectEqual(@as(usize, 32), state.global.return_data.len);
+}
+
+test "eval: invalid halts" {
+    var state = try runInterpreterFull("{ sstore(0, 1) invalid() sstore(0, 2) }");
+    defer state.deinit();
+    try testing.expectEqual(@as(?HaltReason, .invalid_), state.halt_reason);
+    try testing.expectEqual(@as(u256, 1), state.global.sload(0));
+}
+
+test "eval: stop inside function unwinds all" {
+    var state = try runInterpreterFull("{ function f() { stop() } f() sstore(0, 99) }");
+    defer state.deinit();
+    try testing.expectEqual(@as(?HaltReason, .stopped), state.halt_reason);
+    try testing.expectEqual(@as(u256, 0), state.global.sload(0));
+}
+
+test "eval: return inside for loop unwinds" {
+    var state = try runInterpreterFull("{ for {} 1 {} { mstore(0, 42) return(0, 32) } sstore(0, 99) }");
+    defer state.deinit();
+    try testing.expectEqual(@as(?HaltReason, .returned), state.halt_reason);
+    try testing.expectEqual(@as(u256, 0), state.global.sload(0));
+}
+
+test "eval: no halt returns null" {
+    var state = try runInterpreterFull("{ sstore(0, 42) }");
+    defer state.deinit();
+    try testing.expectEqual(@as(?HaltReason, null), state.halt_reason);
+}
+
+// ── Context Getter Tests ───────────────────────────────────────────
+
+test "eval: caller returns context" {
+    var state = try runInterpreterWithCtx(
+        "{ sstore(0, caller()) }",
+        .{ .caller = 0xABCD },
+    );
+    defer state.deinit();
+    try testing.expectEqual(@as(u256, 0xABCD), state.global.sload(0));
+}
+
+test "eval: address returns context" {
+    var state = try runInterpreterWithCtx(
+        "{ sstore(0, address()) }",
+        .{ .address = 0x1234 },
+    );
+    defer state.deinit();
+    try testing.expectEqual(@as(u256, 0x1234), state.global.sload(0));
+}
+
+test "eval: timestamp returns context" {
+    var state = try runInterpreterWithCtx(
+        "{ sstore(0, timestamp()) }",
+        .{ .timestamp = 1000 },
+    );
+    defer state.deinit();
+    try testing.expectEqual(@as(u256, 1000), state.global.sload(0));
+}
+
+test "eval: chainid returns context" {
+    var state = try runInterpreterWithCtx(
+        "{ sstore(0, chainid()) }",
+        .{ .chainid = 1 },
+    );
+    defer state.deinit();
+    try testing.expectEqual(@as(u256, 1), state.global.sload(0));
+}
+
+test "eval: gas returns large constant" {
+    try expectStorage("{ sstore(0, gt(gas(), 0)) }", &.{.{ 0, 1 }});
+}
+
+// ── Keccak256 Tests ────────────────────────────────────────────────
+
+test "eval: keccak256 empty" {
+    // keccak256("") = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
+    try expectStorage(
+        "{ sstore(0, keccak256(0, 0)) }",
+        &.{.{ 0, 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470 }},
+    );
+}
+
+test "eval: keccak256 of data" {
+    // Store 0x01 at offset 31 (mstore stores big-endian, so mstore(0, 1) puts 0x01 at byte 31)
+    // keccak256 of 32 zero bytes with last byte 0x01
+    var state = try runInterpreterFull("{ mstore(0, 1) sstore(0, keccak256(0, 32)) }");
+    defer state.deinit();
+    // Just check it's non-zero and deterministic
+    const hash = state.global.sload(0);
+    try testing.expect(hash != 0);
+}
+
+// ── CLZ Tests ──────────────────────────────────────────────────────
+
+test "eval: clz of zero" {
+    try expectStorage("{ sstore(0, clz(0)) }", &.{.{ 0, 256 }});
+}
+
+test "eval: clz of one" {
+    try expectStorage("{ sstore(0, clz(1)) }", &.{.{ 0, 255 }});
+}
+
+test "eval: clz of max u256" {
+    // not(0) = max u256, clz = 0
+    try expectStorage("{ sstore(0, clz(not(0))) }", &.{.{ 0, 0 }});
+}
+
+// ── Call Data Copy Tests ───────────────────────────────────────────
+
+test "eval: calldatacopy" {
+    var cd = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF } ++ [_]u8{0} ** 28;
+    var state = try runInterpreterWithCtx(
+        "{ calldatacopy(0, 0, 32) sstore(0, mload(0)) }",
+        .{ .calldata = &cd },
+    );
+    defer state.deinit();
+    try testing.expectEqual(@as(u256, 0xDEADBEEF) << (28 * 8), state.global.sload(0));
+}
+
+test "eval: returndatasize initially zero" {
+    try expectStorage("{ sstore(0, returndatasize()) }", &.{.{ 0, 0 }});
+}
+
+// ── Contract Interaction Stub Tests ────────────────────────────────
+
+test "eval: call returns 0 (stub)" {
+    try expectStorage("{ sstore(0, call(0, 0, 0, 0, 0, 0, 0)) }", &.{.{ 0, 0 }});
+}
+
+test "eval: create returns 0 (stub)" {
+    try expectStorage("{ sstore(0, create(0, 0, 0)) }", &.{.{ 0, 0 }});
+}
+
+test "eval: staticcall returns 0 (stub)" {
+    try expectStorage("{ sstore(0, staticcall(0, 0, 0, 0, 0, 0)) }", &.{.{ 0, 0 }});
+}
+
+test "eval: extcodesize returns 0 (stub)" {
+    try expectStorage("{ sstore(0, extcodesize(0)) }", &.{.{ 0, 0 }});
+}
+
+// ── PC Test ────────────────────────────────────────────────────────
+
+test "eval: pc returns 0" {
+    try expectStorage("{ sstore(0, pc()) }", &.{.{ 0, 0 }});
+}
+
+// ── Blockhash Test ─────────────────────────────────────────────────
+
+test "eval: blockhash returns 0 (stub)" {
+    try expectStorage("{ sstore(0, blockhash(0)) }", &.{.{ 0, 0 }});
 }

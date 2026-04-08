@@ -43,6 +43,8 @@ log_entries: std.ArrayListUnmanaged(LogEntry),
 
 /// Return data from last external call.
 return_data: []u8,
+/// Whether return_data was allocated by the interpreter (so deinit can free it).
+return_data_owned: bool,
 
 /// Call data for current execution.
 calldata: []const u8,
@@ -84,6 +86,7 @@ pub fn init(allocator: std.mem.Allocator) Self {
         .transient_storage = .{},
         .log_entries = .{},
         .return_data = &.{},
+        .return_data_owned = false,
         .calldata = &.{},
         .caller = 0,
         .callvalue = 0,
@@ -110,6 +113,9 @@ pub fn deinit(self: *Self) void {
         self.allocator.destroy(entry.value_ptr.*);
     }
     self.pages.deinit(self.allocator);
+    if (self.return_data_owned) {
+        self.allocator.free(self.return_data);
+    }
     self.storage.deinit(self.allocator);
     self.transient_storage.deinit(self.allocator);
     for (self.log_entries.items) |entry| {
@@ -190,7 +196,7 @@ fn writeByte(self: *Self, offset: u256, value: u8) !void {
     page[page_offset] = value;
 }
 
-fn updateMsize(self: *Self, offset: u256, len: u256) void {
+pub fn updateMsize(self: *Self, offset: u256, len: u256) void {
     if (len == 0) return;
     const end = offset +% len;
     const rounded = (end +% 31) & ~@as(u256, 31);

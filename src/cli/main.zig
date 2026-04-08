@@ -40,12 +40,33 @@ pub fn main() !void {
     defer local.deinit();
 
     var interp = gyul.Interpreter.init(allocator, &ast, &global, &local);
-    _ = interp.interpret() catch |err| {
+    const result = interp.interpret() catch |err| {
         std.debug.print("Runtime error: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
 
     const w = std.fs.File.stdout();
+
+    if (result.halt_reason) |reason| {
+        switch (reason) {
+            .stopped => try w.writeAll("Execution stopped.\n"),
+            .returned => {
+                try w.writeAll("Execution returned");
+                if (global.return_data.len > 0) {
+                    try w.writeAll(": 0x");
+                    for (global.return_data) |b| {
+                        var buf: [2]u8 = undefined;
+                        _ = std.fmt.bufPrint(&buf, "{x:0>2}", .{b}) catch unreachable;
+                        try w.writeAll(&buf);
+                    }
+                }
+                try w.writeAll("\n");
+            },
+            .reverted => try w.writeAll("Execution reverted.\n"),
+            .invalid_ => try w.writeAll("Invalid instruction.\n"),
+        }
+    }
+
     try printFinalState(&global, w);
 }
 
