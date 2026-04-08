@@ -269,6 +269,8 @@ local: *LocalState,
 allocator: std.mem.Allocator,
 call_depth: u32,
 halt_reason: ?HaltReason,
+/// Token index of the last runtime error (for source location reporting).
+error_token: ?AST.TokenIndex,
 
 const MAX_CALL_DEPTH = 1024;
 
@@ -282,10 +284,23 @@ pub fn init(allocator: std.mem.Allocator, ast: *const AST, global: *GlobalState,
         .allocator = allocator,
         .call_depth = 0,
         .halt_reason = null,
+        .error_token = null,
     };
 }
 
 // ── Entry Point ─────────────────────────────────────────────────────
+
+/// Returns the source location of the last runtime error, if available.
+pub fn errorLocation(self: *const Self) ?AST.SourceLocation {
+    const tok = self.error_token orelse return null;
+    return self.ast.tokenLocation(tok);
+}
+
+/// Returns the text of the token where the last error occurred.
+pub fn errorTokenText(self: *const Self) ?[]const u8 {
+    const tok = self.error_token orelse return null;
+    return self.ast.tokenSlice(tok);
+}
 
 pub fn interpret(self: *Self) InterpreterError!ExecutionResult {
     _ = self.execStmt(0) catch |err| {
@@ -299,6 +314,7 @@ pub fn interpret(self: *Self) InterpreterError!ExecutionResult {
 
 pub fn evalExpr(self: *Self, node_idx: AST.NodeIndex) InterpreterError!Values {
     const node = self.ast.nodes[node_idx];
+    self.error_token = node.getToken();
     return switch (node) {
         .number_literal => |n| self.evalNumberLiteral(n.token),
         .string_literal => |n| self.evalStringLiteral(n.token),
@@ -491,6 +507,7 @@ fn evalFunctionCall(self: *Self, tok: AST.TokenIndex, args_span: AST.Span) Inter
 
 pub fn execStmt(self: *Self, node_idx: AST.NodeIndex) InterpreterError!StmtResult {
     const node = self.ast.nodes[node_idx];
+    self.error_token = node.getToken();
     return switch (node) {
         .root => |n| self.execBlock(n.body),
         .block => |n| self.execBlock(n.stmts),

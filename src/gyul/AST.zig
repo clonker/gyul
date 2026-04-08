@@ -84,6 +84,31 @@ pub const Error = struct {
     };
 };
 
+pub const SourceLocation = struct {
+    line: u32,
+    col: u32,
+};
+
+pub fn tokenLocation(self: *const Self, tok: TokenIndex) SourceLocation {
+    const starts = self.tokens.items(.start);
+    if (tok >= starts.len) return .{ .line = 1, .col = 1 };
+    return self.byteOffsetLocation(starts[tok]);
+}
+
+pub fn byteOffsetLocation(self: *const Self, byte_offset: ByteOffset) SourceLocation {
+    var line: u32 = 1;
+    var col: u32 = 1;
+    for (self.source[0..@min(byte_offset, self.source.len)]) |c| {
+        if (c == '\n') {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    return .{ .line = line, .col = col };
+}
+
 pub fn spanToList(self: *const Self, span: Span) []const NodeIndex {
     return self.extra[span.start..][0..span.len];
 }
