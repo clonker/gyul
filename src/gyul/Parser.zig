@@ -28,7 +28,9 @@ pub fn parseRoot(self: *Parser) !void {
     const scratch_top = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(scratch_top);
 
-    while (self.peek() != .brace_r and self.peek() != .eof) {
+    while (true) {
+        self.eatComments();
+        if (self.peek() == .brace_r or self.peek() == .eof) break;
         const stmt = try self.parseStatement();
         try self.scratch.append(self.gpa, stmt);
     }
@@ -67,7 +69,9 @@ fn parseBlock(self: *Parser) Error!ast.NodeIndex {
     const scratch_top = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(scratch_top);
 
-    while (self.peek() != .brace_r and self.peek() != .eof) {
+    while (true) {
+        self.eatComments();
+        if (self.peek() == .brace_r or self.peek() == .eof) break;
         const stmt = try self.parseStatement();
         try self.scratch.append(self.gpa, stmt);
     }

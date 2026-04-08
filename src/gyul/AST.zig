@@ -132,6 +132,9 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) !Self {
         .scratch = .{},
     };
     defer parser.scratch.deinit(gpa);
+    errdefer parser.nodes.deinit(gpa);
+    errdefer parser.extra.deinit(gpa);
+    errdefer parser.errors.deinit(gpa);
     try parser.parseRoot();
 
     const nodes = try parser.nodes.toOwnedSlice(gpa);
@@ -162,4 +165,272 @@ pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
     gpa.free(self.extra);
     gpa.free(self.errors);
     self.* = undefined;
+}
+
+// --- Tests ---
+
+fn expectPrint(source: [:0]const u8, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var ast = try Self.parse(allocator, source);
+    defer ast.deinit(allocator);
+    const printed = try ast.print(allocator);
+    defer allocator.free(printed);
+    try std.testing.expectEqualStrings(expected, printed);
+}
+
+fn expectParseError(source: [:0]const u8) !void {
+    const allocator = std.testing.allocator;
+    const result = Self.parse(allocator, source);
+    if (result) |*ast_ptr| {
+        var ast = ast_ptr.*;
+        ast.deinit(allocator);
+        return error.ExpectedParseError;
+    } else |_| {}
+}
+
+test "parse empty block" {
+    try expectPrint("{}", "{\n}\n");
+}
+
+test "parse variable declaration" {
+    try expectPrint("{ let x := 1 }", "{\n  let x := 1\n}\n");
+}
+
+test "parse variable declaration no init" {
+    try expectPrint("{ let x }", "{\n  let x\n}\n");
+}
+
+test "parse multi variable declaration" {
+    try expectPrint("{ let x, y := foo() }", "{\n  let x, y := foo()\n}\n");
+}
+
+test "parse assignment" {
+    try expectPrint("{ let x x := 1 }", "{\n  let x\n  x := 1\n}\n");
+}
+
+test "parse multi assignment" {
+    try expectPrint("{ let x let y x, y := foo() }", "{\n  let x\n  let y\n  x, y := foo()\n}\n");
+}
+
+test "parse function call statement" {
+    try expectPrint("{ sstore(0, 1) }", "{\n  sstore(0, 1)\n}\n");
+}
+
+test "parse nested function call" {
+    try expectPrint("{ sstore(add(1, 2), 3) }", "{\n  sstore(add(1, 2), 3)\n}\n");
+}
+
+test "parse function definition" {
+    try expectPrint(
+        "{ function f(a, b) -> r { r := add(a, b) } }",
+        "{\n  function f(a, b) -> r {\n    r := add(a, b)\n  }\n}\n",
+    );
+}
+
+test "parse function no params no returns" {
+    try expectPrint(
+        "{ function f() { } }",
+        "{\n  function f() {\n  }\n}\n",
+    );
+}
+
+test "parse if statement" {
+    try expectPrint("{ if 1 { } }", "{\n  if 1 {\n  }\n}\n");
+}
+
+test "parse if with body" {
+    try expectPrint(
+        "{ let x if x { x := 0 } }",
+        "{\n  let x\n  if x {\n    x := 0\n  }\n}\n",
+    );
+}
+
+test "parse for loop" {
+    try expectPrint(
+        "{ for { let i := 0 } lt(i, 10) { i := add(i, 1) } { } }",
+        "{\n  for { let i := 0 } lt(i, 10) { i := add(i, 1) } {\n  }\n}\n",
+    );
+}
+
+test "parse for loop with break" {
+    try expectPrint(
+        "{ for { } 1 { } { break } }",
+        "{\n  for {} 1 {} {\n    break\n  }\n}\n",
+    );
+}
+
+test "parse for loop with continue" {
+    try expectPrint(
+        "{ for { } 1 { } { continue } }",
+        "{\n  for {} 1 {} {\n    continue\n  }\n}\n",
+    );
+}
+
+test "parse switch case default" {
+    try expectPrint(
+        "{ switch 1 case 0 { } case 1 { } default { } }",
+        "{\n  switch 1\n  case 0 {\n  }\n  case 1 {\n  }\n  default {\n  }\n}\n",
+    );
+}
+
+test "parse switch with body" {
+    try expectPrint(
+        "{ let y switch 1 case 0 { y := 0 } default { y := 1 } }",
+        "{\n  let y\n  switch 1\n  case 0 {\n    y := 0\n  }\n  default {\n    y := 1\n  }\n}\n",
+    );
+}
+
+test "parse leave in function" {
+    try expectPrint(
+        "{ function f() { leave } }",
+        "{\n  function f() {\n    leave\n  }\n}\n",
+    );
+}
+
+test "parse hex literal" {
+    try expectPrint("{ let x := 0xFF }", "{\n  let x := 0xFF\n}\n");
+}
+
+test "parse comments are skipped" {
+    try expectPrint(
+        "{ /* comment */ let x := 1 // line\n }",
+        "{\n  let x := 1\n}\n",
+    );
+}
+
+test "parse nested blocks" {
+    try expectPrint("{ { { } } }", "{\n  {\n    {\n    }\n  }\n}\n");
+}
+
+test "parse error: missing opening brace" {
+    try expectParseError("let x := 1");
+}
+
+test "parse error: missing closing brace" {
+    try expectParseError("{ let x := 1");
+}
+
+test "fuzz parser" {
+    const Ctx = struct {
+        fn run(_: @This(), input: []const u8) anyerror!void {
+            const alloc = std.testing.allocator;
+            const source = try alloc.allocSentinel(u8, input.len, 0);
+            defer alloc.free(source);
+            @memcpy(source[0..input.len], input);
+
+            var ast = Self.parse(alloc, source) catch return;
+            defer ast.deinit(alloc);
+
+            // If it parsed, printing must not crash
+            const printed = ast.print(alloc) catch return;
+            alloc.free(printed);
+        }
+    };
+    try std.testing.fuzz(Ctx{}, Ctx.run, .{});
+}
+
+test "fuzz round trip" {
+    const Ctx = struct {
+        fn run(_: @This(), input: []const u8) anyerror!void {
+            const alloc = std.testing.allocator;
+            const source = try alloc.allocSentinel(u8, input.len, 0);
+            defer alloc.free(source);
+            @memcpy(source[0..input.len], input);
+
+            // First parse
+            var ast1 = Self.parse(alloc, source) catch return;
+            defer ast1.deinit(alloc);
+
+            const print1 = ast1.print(alloc) catch return;
+            defer alloc.free(print1);
+
+            // Re-parse the printed output
+            const source2 = try alloc.allocSentinel(u8, print1.len, 0);
+            defer alloc.free(source2);
+            @memcpy(source2[0..print1.len], print1);
+
+            var ast2 = Self.parse(alloc, source2) catch return;
+            defer ast2.deinit(alloc);
+
+            const print2 = ast2.print(alloc) catch return;
+            defer alloc.free(print2);
+
+            // Round-trip invariant: print(parse(print(parse(x)))) == print(parse(x))
+            try std.testing.expectEqualStrings(print1, print2);
+        }
+    };
+    try std.testing.fuzz(Ctx{}, Ctx.run, .{});
+}
+
+test "fuzz differential" {
+    // Only runs if reference binary exists
+    const ref_path = "test/ref/build/yul_ref";
+    std.fs.cwd().access(ref_path, .{}) catch return;
+
+    const Ctx = struct {
+        fn run(_: @This(), input: []const u8) anyerror!void {
+            const alloc = std.testing.allocator;
+            const source = try alloc.allocSentinel(u8, input.len, 0);
+            defer alloc.free(source);
+            @memcpy(source[0..input.len], input);
+
+            // A = gyul parse + print
+            var ast1 = Self.parse(alloc, source) catch return;
+            defer ast1.deinit(alloc);
+
+            const print_a = ast1.print(alloc) catch return;
+            defer alloc.free(print_a);
+
+            // B = solc ref parse + print of A
+            const print_b = runRef(alloc, print_a) catch return;
+            defer alloc.free(print_b);
+
+            // C = gyul parse + print of B
+            const source_b = try alloc.allocSentinel(u8, print_b.len, 0);
+            defer alloc.free(source_b);
+            @memcpy(source_b[0..print_b.len], print_b);
+
+            var ast3 = Self.parse(alloc, source_b) catch return;
+            defer ast3.deinit(alloc);
+
+            const print_c = ast3.print(alloc) catch return;
+            defer alloc.free(print_c);
+
+            // Invariant: A == C
+            try std.testing.expectEqualStrings(print_a, print_c);
+        }
+    };
+    try std.testing.fuzz(Ctx{}, Ctx.run, .{});
+}
+
+fn runRef(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+    var child = std.process.Child.init(
+        &.{"test/ref/build/yul_ref"},
+        alloc,
+    );
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+
+    child.stdin.?.writeAll(input) catch {};
+    child.stdin.?.close();
+    child.stdin = null;
+
+    const stdout = try child.stdout.?.readToEndAlloc(alloc, 1024 * 1024);
+    errdefer alloc.free(stdout);
+
+    const term = try child.wait();
+    if (term.Exited != 0) return error.RefFailed;
+
+    // Trim trailing newline
+    var len = stdout.len;
+    while (len > 0 and stdout[len - 1] == '\n') len -= 1;
+    if (len < stdout.len) {
+        const trimmed = try alloc.alloc(u8, len);
+        @memcpy(trimmed, stdout[0..len]);
+        alloc.free(stdout);
+        return trimmed;
+    }
+    return stdout;
 }

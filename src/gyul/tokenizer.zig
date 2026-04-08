@@ -290,14 +290,172 @@ pub const GYulTokenizer = struct {
     }
 };
 
-test "string literals" {
-    const source = "\"fu\\nfu\" 8";
-    var tokenizer = GYulTokenizer.init(source);
-    var currentToken = tokenizer.next();
-    while(currentToken.tag != .eof) : (currentToken = tokenizer.next()) {
-        tokenizer.dump(&currentToken);
+const TagResult = struct { tags: [64]Tag, len: usize };
+
+fn collectTags(source: [:0]const u8) TagResult {
+    var result: TagResult = .{ .tags = undefined, .len = 0 };
+    var tok = GYulTokenizer.init(source);
+    while (true) {
+        const t = tok.next();
+        result.tags[result.len] = t.tag;
+        result.len += 1;
+        if (t.tag == .eof) break;
     }
-    tokenizer.dump(&currentToken);
+    return result;
+}
+
+fn expectTags(source: [:0]const u8, expected: []const Tag) !void {
+    const result = collectTags(source);
+    try std.testing.expectEqual(expected.len, result.len);
+    for (expected, 0..) |exp, i| {
+        try std.testing.expectEqual(exp, result.tags[i]);
+    }
+}
+
+test "empty input" {
+    try expectTags("", &.{.eof});
+}
+
+test "whitespace only" {
+    try expectTags("  \t\n\r  ", &.{.eof});
+}
+
+test "keywords" {
+    try expectTags("function", &.{ .keyword_function, .eof });
+    try expectTags("let", &.{ .keyword_let, .eof });
+    try expectTags("if", &.{ .keyword_if, .eof });
+    try expectTags("switch", &.{ .keyword_switch, .eof });
+    try expectTags("case", &.{ .keyword_case, .eof });
+    try expectTags("default", &.{ .keyword_default, .eof });
+    try expectTags("for", &.{ .keyword_for, .eof });
+    try expectTags("break", &.{ .keyword_break, .eof });
+    try expectTags("continue", &.{ .keyword_continue, .eof });
+    try expectTags("leave", &.{ .keyword_leave, .eof });
+    try expectTags("true", &.{ .keyword_true, .eof });
+    try expectTags("false", &.{ .keyword_false, .eof });
+    try expectTags("hex", &.{ .keyword_hex, .eof });
+}
+
+test "keyword prefixes are identifiers" {
+    try expectTags("func", &.{ .identifier, .eof });
+    try expectTags("letting", &.{ .identifier, .eof });
+    try expectTags("iffy", &.{ .identifier, .eof });
+    try expectTags("forked", &.{ .identifier, .eof });
+    try expectTags("breaking", &.{ .identifier, .eof });
+}
+
+test "operators" {
+    try expectTags(":=", &.{ .colon_assign, .eof });
+    try expectTags("->", &.{ .arrow, .eof });
+    try expectTags(",", &.{ .comma, .eof });
+}
+
+test "delimiters" {
+    try expectTags("(", &.{ .parenthesis_l, .eof });
+    try expectTags(")", &.{ .parenthesis_r, .eof });
+    try expectTags("{", &.{ .brace_l, .eof });
+    try expectTags("}", &.{ .brace_r, .eof });
+    try expectTags("[", &.{ .bracket_l, .eof });
+    try expectTags("]", &.{ .bracket_r, .eof });
+    try expectTags("()[]{}", &.{ .parenthesis_l, .parenthesis_r, .bracket_l, .bracket_r, .brace_l, .brace_r, .eof });
+}
+
+test "number literals" {
+    try expectTags("42", &.{ .number_literal, .eof });
+    try expectTags("0", &.{ .number_literal, .eof });
+    try expectTags("123456789", &.{ .number_literal, .eof });
+}
+
+test "hex number literals" {
+    try expectTags("0x0", &.{ .hex_number_literal, .eof });
+    try expectTags("0x2a", &.{ .hex_number_literal, .eof });
+    try expectTags("0xFF", &.{ .hex_number_literal, .eof });
+    try expectTags("0xDeAdBeEf", &.{ .hex_number_literal, .eof });
+}
+
+test "string literals" {
+    try expectTags("\"hello\"", &.{ .string_literal, .eof });
+    try expectTags("\"\"", &.{ .string_literal, .eof });
+    try expectTags("\"fu\\nfu\"", &.{ .string_literal, .eof });
+    try expectTags("\"a\\\"b\"", &.{ .string_literal, .eof });
+}
+
+test "string literal edge cases" {
+    // Unterminated string
+    try expectTags("\"hello", &.{ .invalid, .eof });
+    // String with newline (invalid)
+    try expectTags("\"hello\nworld\"", &.{ .invalid, .identifier, .invalid, .eof });
+}
+
+test "comments" {
+    try expectTags("// single line\n42", &.{ .comment_single_line, .number_literal, .eof });
+    try expectTags("/* multi */", &.{ .comment_multi_line, .eof });
+    try expectTags("/* multi\nline\ncomment */", &.{ .comment_multi_line, .eof });
+    try expectTags("/* a */ /* b */", &.{ .comment_multi_line, .comment_multi_line, .eof });
+}
+
+test "unterminated comment" {
+    try expectTags("/* no end", &.{ .invalid, .eof });
+}
+
+test "identifiers" {
+    try expectTags("x", &.{ .identifier, .eof });
+    try expectTags("_foo", &.{ .identifier, .eof });
+    try expectTags("camelCase123", &.{ .identifier, .eof });
+    try expectTags("ALL_CAPS", &.{ .identifier, .eof });
+}
+
+test "invalid characters" {
+    try expectTags(":", &.{ .invalid, .eof });
+    try expectTags("-", &.{ .invalid, .eof });
+    try expectTags("/", &.{ .invalid, .eof });
+    try expectTags("@", &.{ .invalid, .eof });
+}
+
+test "complex token sequence" {
+    try expectTags("let x := add(1, 0x2a)", &.{
+        .keyword_let,
+        .identifier,
+        .colon_assign,
+        .identifier,
+        .parenthesis_l,
+        .number_literal,
+        .comma,
+        .hex_number_literal,
+        .parenthesis_r,
+        .eof,
+    });
+}
+
+test "function definition tokens" {
+    try expectTags("function f(a, b) -> r {}", &.{
+        .keyword_function,
+        .identifier,
+        .parenthesis_l,
+        .identifier,
+        .comma,
+        .identifier,
+        .parenthesis_r,
+        .arrow,
+        .identifier,
+        .brace_l,
+        .brace_r,
+        .eof,
+    });
+}
+
+test "for loop tokens" {
+    try expectTags("for { } 1 { } { }", &.{
+        .keyword_for,
+        .brace_l,
+        .brace_r,
+        .number_literal,
+        .brace_l,
+        .brace_r,
+        .brace_l,
+        .brace_r,
+        .eof,
+    });
 }
 
 test "fuzz tokenizer" {
