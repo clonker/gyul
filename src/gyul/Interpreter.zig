@@ -73,7 +73,9 @@ pub const InterpreterError = error{
     InvalidLiteral,
     StackOverflow,
     ExecutionHalt,
-} || std.mem.Allocator.Error;
+    MemoryRangeTooLarge,
+    ReturnDataTooLarge,
+} || std.mem.Allocator.Error || std.Io.Writer.Error;
 
 // ── Builtins ────────────────────────────────────────────────────────
 
@@ -732,25 +734,25 @@ fn evalBuiltin(self: *Self, tag: BuiltinTag, args: []const u256) InterpreterErro
         .byte_ => bin(u256_ops.byte_, args),
         // Storage
         .sstore => {
-            self.global.sstore(args[0], args[1]) catch return error.OutOfMemory;
+            try self.global.sstore(args[0], args[1]);
             return .none;
         },
         .sload => .{ .single = self.global.sload(args[0]) },
         .tstore => {
-            self.global.tstore(args[0], args[1]) catch return error.OutOfMemory;
+            try self.global.tstore(args[0], args[1]);
             return .none;
         },
         .tload => .{ .single = self.global.tload(args[0]) },
         // Memory
         .mstore => {
-            self.global.memStore(args[0], args[1]) catch return error.OutOfMemory;
+            try self.global.memStore(args[0], args[1]);
             return .none;
         },
         .mstore8 => {
-            self.global.memStore8(args[0], args[1]) catch return error.OutOfMemory;
+            try self.global.memStore8(args[0], args[1]);
             return .none;
         },
-        .mload => .{ .single = self.global.memLoad(args[0]) catch return error.OutOfMemory },
+        .mload => .{ .single = try self.global.memLoad(args[0]) },
         .msize => .{ .single = self.global.getMsize() },
         // Logging
         .log0, .log1, .log2, .log3, .log4 => {
@@ -766,7 +768,7 @@ fn evalBuiltin(self: *Self, tag: BuiltinTag, args: []const u256) InterpreterErro
         },
         // Memory copy
         .mcopy => {
-            self.global.memCopy(args[0], args[1], args[2]) catch return error.OutOfMemory;
+            try self.global.memCopy(args[0], args[1], args[2]);
             return .none;
         },
         // Call data & return data

@@ -70,7 +70,7 @@ blobbasefee: u256,
 
 /// Optional writer for execution trace. Set to any writer (stderr, file,
 /// buffer, etc.) to enable tracing. null = no tracing.
-tracer: ?std.io.AnyWriter,
+tracer: ?*std.Io.Writer,
 /// When true, memory-writing instructions are not traced.
 disable_mem_write_trace: bool,
 
@@ -129,7 +129,7 @@ pub fn deinit(self: *Self) void {
 
 /// Emit a trace line: "NAME(arg1, arg2, ...) [hexdata]\n"
 /// No-op if tracer is null, or if writes_memory and mem write tracing is disabled.
-pub fn logTrace(self: *Self, name: []const u8, args: []const u256, data: []const u8, writes_memory: bool) !void {
+pub fn logTrace(self: *Self, name: []const u8, args: []const u256, data: []const u8, writes_memory: bool) std.Io.Writer.Error!void {
     const w = self.tracer orelse return;
     if (writes_memory and self.disable_mem_write_trace) return;
 
@@ -142,16 +142,14 @@ pub fn logTrace(self: *Self, name: []const u8, args: []const u256, data: []const
     try w.writeByte(')');
     if (data.len > 0) {
         try w.writeAll(" [0x");
-        for (data) |b| {
-            try std.fmt.format(w, "{x:0>2}", .{b});
-        }
+        try w.printHex(data, .lower);
         try w.writeByte(']');
     }
     try w.writeByte('\n');
 }
 
 /// Format a u256 as "0x" + minimal hex digits. Zero is "0x00".
-pub fn writeU256(writer: anytype, value: u256) !void {
+pub fn writeU256(writer: *std.Io.Writer, value: u256) std.Io.Writer.Error!void {
     if (value == 0) {
         try writer.writeAll("0x00");
         return;
@@ -160,9 +158,7 @@ pub fn writeU256(writer: anytype, value: u256) !void {
     var start: usize = 0;
     while (start < 32 and bytes[start] == 0) start += 1;
     try writer.writeAll("0x");
-    for (bytes[start..]) |b| {
-        try std.fmt.format(writer, "{x:0>2}", .{b});
-    }
+    try writer.printHex(bytes[start..], .lower);
 }
 
 // ── Memory Operations ────────────────────────────────────────────────
@@ -331,33 +327,24 @@ pub fn addLog(self: *Self, offset: u256, len: u256, data: []const u8, topics: []
 
 const testing = std.testing;
 
-/// Helper: create a GlobalState with tracing into an ArrayList buffer.
+/// Helper: create a GlobalState with tracing into an Allocating writer.
 const TraceTestHelper = struct {
-    buf: std.ArrayListUnmanaged(u8),
+    alloc: std.Io.Writer.Allocating,
 
-    fn init() TraceTestHelper {
-        return .{ .buf = .{} };
+    fn init(allocator: std.mem.Allocator) TraceTestHelper {
+        return .{ .alloc = std.Io.Writer.Allocating.init(allocator) };
     }
 
-    fn writer(self: *TraceTestHelper) std.io.AnyWriter {
-        return .{
-            .context = @ptrCast(self),
-            .writeFn = &writeFn,
-        };
+    fn writer(self: *TraceTestHelper) *std.Io.Writer {
+        return &self.alloc.writer;
     }
 
-    fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-        const self: *TraceTestHelper = @constCast(@alignCast(@ptrCast(context)));
-        self.buf.appendSlice(testing.allocator, bytes) catch |e| return e;
-        return bytes.len;
-    }
-
-    fn output(self: *const TraceTestHelper) []const u8 {
-        return self.buf.items;
+    fn output(self: *TraceTestHelper) []const u8 {
+        return self.alloc.written();
     }
 
     fn deinit(self: *TraceTestHelper) void {
-        self.buf.deinit(testing.allocator);
+        self.alloc.deinit();
     }
 };
 
@@ -495,7 +482,7 @@ test "memory: memCopy non-overlapping" {
 // ── Trace Tests ──────────────────────────────────────────────────────
 
 test "trace: sstore emits trace line" {
-    var th = TraceTestHelper.init();
+    var th = TraceTestHelper.init(testing.allocator);
     defer th.deinit();
 
     var gs = Self.init(testing.allocator);
@@ -507,7 +494,7 @@ test "trace: sstore emits trace line" {
 }
 
 test "trace: mstore emits trace line" {
-    var th = TraceTestHelper.init();
+    var th = TraceTestHelper.init(testing.allocator);
     defer th.deinit();
 
     var gs = Self.init(testing.allocator);
@@ -519,7 +506,7 @@ test "trace: mstore emits trace line" {
 }
 
 test "trace: mstore8 emits trace line" {
-    var th = TraceTestHelper.init();
+    var th = TraceTestHelper.init(testing.allocator);
     defer th.deinit();
 
     var gs = Self.init(testing.allocator);
@@ -531,7 +518,7 @@ test "trace: mstore8 emits trace line" {
 }
 
 test "trace: tstore emits trace line" {
-    var th = TraceTestHelper.init();
+    var th = TraceTestHelper.init(testing.allocator);
     defer th.deinit();
 
     var gs = Self.init(testing.allocator);
@@ -543,7 +530,7 @@ test "trace: tstore emits trace line" {
 }
 
 test "trace: log emits trace with data" {
-    var th = TraceTestHelper.init();
+    var th = TraceTestHelper.init(testing.allocator);
     defer th.deinit();
 
     var gs = Self.init(testing.allocator);
@@ -556,7 +543,7 @@ test "trace: log emits trace with data" {
 }
 
 test "trace: disable_mem_write_trace suppresses memory writes" {
-    var th = TraceTestHelper.init();
+    var th = TraceTestHelper.init(testing.allocator);
     defer th.deinit();
 
     var gs = Self.init(testing.allocator);
@@ -584,7 +571,7 @@ test "trace: null tracer is silent" {
 }
 
 test "trace: multiple operations accumulate" {
-    var th = TraceTestHelper.init();
+    var th = TraceTestHelper.init(testing.allocator);
     defer th.deinit();
 
     var gs = Self.init(testing.allocator);
@@ -600,15 +587,15 @@ test "trace: multiple operations accumulate" {
 }
 
 test "trace: writeU256 zero" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    defer buf.deinit(testing.allocator);
-    try writeU256(buf.writer(testing.allocator), 0);
-    try testing.expectEqualStrings("0x00", buf.items);
+    var alloc = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc.deinit();
+    try writeU256(&alloc.writer, 0);
+    try testing.expectEqualStrings("0x00", alloc.written());
 }
 
 test "trace: writeU256 large value" {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    defer buf.deinit(testing.allocator);
-    try writeU256(buf.writer(testing.allocator), std.math.maxInt(u256));
-    try testing.expectEqualStrings("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", buf.items);
+    var alloc = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc.deinit();
+    try writeU256(&alloc.writer, std.math.maxInt(u256));
+    try testing.expectEqualStrings("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", alloc.written());
 }

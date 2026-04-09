@@ -1,15 +1,15 @@
 const std = @import("std");
 const gyul = @import("gyul");
 
-fn stdoutWriteFn(_: *const anyopaque, bytes: []const u8) anyerror!usize {
-    const file = std.fs.File.stdout();
-    return file.write(bytes);
-}
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) std.debug.print("memory leaks detected\n", .{});
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
+    defer stdout.flush() catch {};
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -76,10 +76,7 @@ pub fn main() !void {
     var global = gyul.GlobalState.init(allocator);
     defer global.deinit();
     if (trace) {
-        global.tracer = .{
-            .context = undefined,
-            .writeFn = &stdoutWriteFn,
-        };
+        global.tracer = stdout;
     }
     global.calldata = calldata;
 
@@ -99,49 +96,35 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    const w = std.fs.File.stdout();
-
     if (result.halt_reason) |reason| {
         switch (reason) {
-            .stopped => try w.writeAll("Execution stopped.\n"),
+            .stopped => try stdout.writeAll("Execution stopped.\n"),
             .returned => {
-                try w.writeAll("Execution returned");
+                try stdout.writeAll("Execution returned");
                 if (global.return_data.len > 0) {
-                    try w.writeAll(": 0x");
-                    for (global.return_data) |b| {
-                        var buf: [2]u8 = undefined;
-                        _ = std.fmt.bufPrint(&buf, "{x:0>2}", .{b}) catch unreachable;
-                        try w.writeAll(&buf);
-                    }
+                    try stdout.writeAll(": 0x");
+                    try stdout.printHex(global.return_data, .lower);
                 }
-                try w.writeAll("\n");
+                try stdout.writeByte('\n');
             },
-            .reverted => try w.writeAll("Execution reverted.\n"),
-            .invalid_ => try w.writeAll("Invalid instruction.\n"),
+            .reverted => try stdout.writeAll("Execution reverted.\n"),
+            .invalid_ => try stdout.writeAll("Invalid instruction.\n"),
         }
     }
 
-    try printFinalState(&global, w);
+    try printFinalState(&global, stdout);
 }
 
-fn printFinalState(global: *gyul.GlobalState, file: std.fs.File) !void {
-    var buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer();
-
-    const stdout = file;
-
+fn printFinalState(global: *gyul.GlobalState, stdout: *std.Io.Writer) !void {
     // Storage
     if (global.storage.count() > 0) {
         try stdout.writeAll("\nStorage:\n");
         var it = global.storage.iterator();
         while (it.next()) |entry| {
-            fbs.reset();
-            try gyul.GlobalState.writeU256(writer, entry.key_ptr.*);
-            try writer.writeAll(": ");
-            try gyul.GlobalState.writeU256(writer, entry.value_ptr.*);
-            try writer.writeByte('\n');
-            try stdout.writeAll(fbs.getWritten());
+            try gyul.GlobalState.writeU256(stdout, entry.key_ptr.*);
+            try stdout.writeAll(": ");
+            try gyul.GlobalState.writeU256(stdout, entry.value_ptr.*);
+            try stdout.writeByte('\n');
         }
     }
 
@@ -150,12 +133,10 @@ fn printFinalState(global: *gyul.GlobalState, file: std.fs.File) !void {
         try stdout.writeAll("\nTransient storage:\n");
         var it = global.transient_storage.iterator();
         while (it.next()) |entry| {
-            fbs.reset();
-            try gyul.GlobalState.writeU256(writer, entry.key_ptr.*);
-            try writer.writeAll(": ");
-            try gyul.GlobalState.writeU256(writer, entry.value_ptr.*);
-            try writer.writeByte('\n');
-            try stdout.writeAll(fbs.getWritten());
+            try gyul.GlobalState.writeU256(stdout, entry.key_ptr.*);
+            try stdout.writeAll(": ");
+            try gyul.GlobalState.writeU256(stdout, entry.value_ptr.*);
+            try stdout.writeByte('\n');
         }
     }
 
@@ -168,16 +149,12 @@ fn printFinalState(global: *gyul.GlobalState, file: std.fs.File) !void {
         while (offset < limit) : (offset += 32) {
             const word = global.memLoad(@intCast(offset)) catch break;
             if (word == 0) continue;
-            fbs.reset();
-            try std.fmt.format(writer, "  [{x:0>4}] ", .{offset});
-            try gyul.GlobalState.writeU256(writer, word);
-            try writer.writeByte('\n');
-            try stdout.writeAll(fbs.getWritten());
+            try stdout.print("  [{x:0>4}] ", .{offset});
+            try gyul.GlobalState.writeU256(stdout, word);
+            try stdout.writeByte('\n');
         }
         if (msize > 4096) {
-            fbs.reset();
-            try std.fmt.format(writer, "  ... ({} bytes total)\n", .{msize});
-            try stdout.writeAll(fbs.getWritten());
+            try stdout.print("  ... ({} bytes total)\n", .{msize});
         }
     }
 
@@ -185,18 +162,16 @@ fn printFinalState(global: *gyul.GlobalState, file: std.fs.File) !void {
     if (global.log_entries.items.len > 0) {
         try stdout.writeAll("\nLogs:\n");
         for (global.log_entries.items, 0..) |entry, i| {
-            fbs.reset();
-            try std.fmt.format(writer, "  log[{}]: {} bytes, {} topics", .{ i, entry.data.len, entry.topics.len });
+            try stdout.print("  log[{}]: {} bytes, {} topics", .{ i, entry.data.len, entry.topics.len });
             if (entry.topics.len > 0) {
-                try writer.writeAll(" (");
+                try stdout.writeAll(" (");
                 for (entry.topics, 0..) |topic, j| {
-                    if (j > 0) try writer.writeAll(", ");
-                    try gyul.GlobalState.writeU256(writer, topic);
+                    if (j > 0) try stdout.writeAll(", ");
+                    try gyul.GlobalState.writeU256(stdout, topic);
                 }
-                try writer.writeByte(')');
+                try stdout.writeByte(')');
             }
-            try writer.writeByte('\n');
-            try stdout.writeAll(fbs.getWritten());
+            try stdout.writeByte('\n');
         }
     }
 }
