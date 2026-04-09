@@ -759,11 +759,13 @@ fn evalBuiltin(self: *Self, tag: BuiltinTag, args: []const u256) InterpreterErro
             const num_topics: usize = @intFromEnum(tag) - @intFromEnum(BuiltinTag.log0);
             const offset = args[0];
             const len = args[1];
-            const size: usize = if (len > 4096) 4096 else @intCast(len);
+            self.global.updateMsize(offset, len);
+            if (len > std.math.maxInt(usize)) return error.MemoryRangeTooLarge;
+            const size: usize = @intCast(len);
             const data = try self.allocator.alloc(u8, size);
             defer self.allocator.free(data);
             self.global.memRead(offset, data);
-            self.global.addLog(offset, len, data, args[2..][0..num_topics]) catch return error.OutOfMemory;
+            try self.global.addLog(offset, data, args[2..][0..num_topics]);
             return .none;
         },
         // Memory copy

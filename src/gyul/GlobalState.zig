@@ -303,10 +303,10 @@ pub fn tstore(self: *Self, key: u256, value: u256) !void {
 
 // ── Logging ──────────────────────────────────────────────────────────
 
-pub fn addLog(self: *Self, offset: u256, len: u256, data: []const u8, topics: []const u256) !void {
+pub fn addLog(self: *Self, offset: u256, data: []const u8, topics: []const u256) !void {
     var trace_args: [6]u256 = undefined;
     trace_args[0] = offset;
-    trace_args[1] = len;
+    trace_args[1] = data.len;
     for (topics, 0..) |t, i| {
         trace_args[2 + i] = t;
     }
@@ -451,7 +451,7 @@ test "logging: records entries" {
 
     const data = "hello";
     const topics = [_]u256{ 1, 2, 3 };
-    try gs.addLog(0, 5, data, &topics);
+    try gs.addLog(0, data, &topics);
 
     try testing.expectEqual(@as(usize, 1), gs.log_entries.items.len);
     try testing.expectEqualSlices(u8, "hello", gs.log_entries.items[0].data);
@@ -538,7 +538,7 @@ test "trace: log emits trace with data" {
     gs.tracer = th.writer();
 
     const topics = [_]u256{0xDEAD};
-    try gs.addLog(0, 3, &[_]u8{ 0xCA, 0xFE, 0x01 }, &topics);
+    try gs.addLog(0, &[_]u8{ 0xCA, 0xFE, 0x01 }, &topics);
     try testing.expectEqualStrings("LOG1(0x00, 0x03, 0xdead) [0xcafe01]\n", th.output());
 }
 
