@@ -127,6 +127,8 @@ pub fn tokenSlice(self: *const Self, tok: TokenIndex) []const u8 {
 }
 
 pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) !Self {
+    if (source.len > std.math.maxInt(ByteOffset)) return error.SourceTooLarge;
+
     var tokens = TokenList{};
     defer tokens.deinit(gpa);
 
