@@ -827,12 +827,8 @@ fn evalBuiltin(self: *Self, tag: BuiltinTag, args: []const u256) InterpreterErro
             const offset = args[0];
             const len = args[1];
             self.global.updateMsize(offset, len);
-            const size: usize = if (len > 0x100000) 0x100000 else @intCast(len);
-            const buf = try self.allocator.alloc(u8, size);
-            defer self.allocator.free(buf);
-            self.global.memRead(offset, buf);
             var hash: [32]u8 = undefined;
-            std.crypto.hash.sha3.Keccak256.hash(buf, &hash, .{});
+            try self.global.keccak256Range(offset, len, &hash);
             break :blk .{ .single = std.mem.readInt(u256, &hash, .big) };
         },
         .blockhash => .{ .single = 0 }, // stub

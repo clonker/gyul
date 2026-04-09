@@ -230,7 +230,7 @@ pub fn memStore8(self: *Self, offset: u256, value: u256) !void {
 }
 
 /// Copy a range of memory bytes into the provided buffer.
-pub fn memRead(self: *Self, offset: u256, buf: []u8) void {
+pub fn memRead(self: *const Self, offset: u256, buf: []u8) void {
     for (buf, 0..) |*b, i| {
         b.* = self.readByte(offset +% @as(u256, @intCast(i)));
     }
@@ -242,6 +242,54 @@ pub fn memWrite(self: *Self, offset: u256, data: []const u8) !void {
     self.updateMsize(offset, @intCast(data.len));
     for (data, 0..) |b, i| {
         try self.writeByte(offset +% @as(u256, @intCast(i)), b);
+    }
+}
+
+/// Stream a range of memory through a Keccak-256 hasher without
+/// allocating the full range. Reads are page-aware: unallocated pages
+/// contribute zero bytes. Length is bounded only by `usize`.
+pub fn keccak256Range(self: *const Self, offset: u256, len: u256, out: *[32]u8) error{MemoryRangeTooLarge}!void {
+    if (len > std.math.maxInt(usize)) return error.MemoryRangeTooLarge;
+    var hasher = std.crypto.hash.sha3.Keccak256.init(.{});
+    if (len == 0) {
+        hasher.final(out);
+        return;
+    }
+    var remaining: usize = @intCast(len);
+    var current = offset;
+    var chunk_buf: [PAGE_SIZE]u8 = undefined;
+    while (remaining > 0) {
+        const chunk = @min(remaining, chunk_buf.len);
+        for (chunk_buf[0..chunk], 0..) |*b, i| {
+            b.* = self.readByte(current +% @as(u256, @intCast(i)));
+        }
+        hasher.update(chunk_buf[0..chunk]);
+        current +%= @as(u256, @intCast(chunk));
+        remaining -= chunk;
+    }
+    hasher.final(out);
+}
+
+/// Zero a range of memory [offset, offset + len). Only existing pages
+/// are touched; unallocated pages stay absent because zero is the
+/// default for unmapped reads. Wrap-around addressing is not supported
+/// here — callers must ensure offset + len does not wrap.
+pub fn memZeroRange(self: *Self, offset: u256, len: u256) void {
+    if (len == 0) return;
+    self.updateMsize(offset, len);
+    const end = offset +% len;
+    var it = self.pages.iterator();
+    while (it.next()) |entry| {
+        const page_num = entry.key_ptr.*;
+        const page_start: u256 = page_num << PAGE_BITS;
+        const page_end: u256 = page_start + PAGE_SIZE;
+        const lo = @max(offset, page_start);
+        const hi = @min(end, page_end);
+        if (lo >= hi) continue;
+        const page = entry.value_ptr.*;
+        const lo_in_page: usize = @intCast(lo - page_start);
+        const hi_in_page: usize = @intCast(hi - page_start);
+        @memset(page[lo_in_page..hi_in_page], 0);
     }
 }
 
@@ -477,6 +525,112 @@ test "memory: memCopy non-overlapping" {
     try gs.memStore(0, 0x1234);
     try gs.memCopy(32, 0, 32);
     try testing.expectEqual(@as(u256, 0x1234), try gs.memLoad(32));
+}
+
+// ── keccak256Range Tests ─────────────────────────────────────────────
+
+/// Reference implementation: read the entire range into one allocation
+/// and hash it in a single call. Used to validate the streaming version.
+fn referenceKeccak256(gs: *const Self, allocator: std.mem.Allocator, offset: u256, len: u256, out: *[32]u8) !void {
+    const size: usize = @intCast(len);
+    const buf = try allocator.alloc(u8, size);
+    defer allocator.free(buf);
+    gs.memRead(offset, buf);
+    std.crypto.hash.sha3.Keccak256.hash(buf, out, .{});
+}
+
+fn expectKeccakMatchesReference(gs: *Self, offset: u256, len: u256) !void {
+    var streaming: [32]u8 = undefined;
+    try gs.keccak256Range(offset, len, &streaming);
+
+    var reference: [32]u8 = undefined;
+    try referenceKeccak256(gs, testing.allocator, offset, len, &reference);
+
+    try testing.expectEqualSlices(u8, &reference, &streaming);
+}
+
+test "keccak256Range: empty range matches reference" {
+    var gs = Self.init(testing.allocator);
+    defer gs.deinit();
+    try expectKeccakMatchesReference(&gs, 0, 0);
+    try expectKeccakMatchesReference(&gs, 12345, 0);
+}
+
+test "keccak256Range: small range within one page matches reference" {
+    var gs = Self.init(testing.allocator);
+    defer gs.deinit();
+
+    try gs.memStore(0, 0xDEADBEEF);
+    try gs.memStore(32, 0xCAFEBABE);
+
+    try expectKeccakMatchesReference(&gs, 0, 64);
+    try expectKeccakMatchesReference(&gs, 5, 50);
+    try expectKeccakMatchesReference(&gs, 30, 4);
+}
+
+test "keccak256Range: range crossing page boundary matches reference" {
+    var gs = Self.init(testing.allocator);
+    defer gs.deinit();
+
+    // Write across the boundary between page 0 and page 1.
+    try gs.memStore(PAGE_SIZE - 32, 0x11);
+    try gs.memStore(PAGE_SIZE, 0x22);
+
+    try expectKeccakMatchesReference(&gs, PAGE_SIZE - 64, 128);
+    try expectKeccakMatchesReference(&gs, PAGE_SIZE - 1, 33);
+}
+
+test "keccak256Range: sparse range with unallocated gaps matches reference" {
+    var gs = Self.init(testing.allocator);
+    defer gs.deinit();
+
+    // Touch only pages 0 and 2; page 1 is unallocated zeros.
+    try gs.memStore(0, 0xAAAA);
+    try gs.memStore(2 * PAGE_SIZE, 0xBBBB);
+
+    try expectKeccakMatchesReference(&gs, 0, 3 * PAGE_SIZE);
+    try expectKeccakMatchesReference(&gs, PAGE_SIZE / 2, 2 * PAGE_SIZE);
+}
+
+test "keccak256Range: range entirely in unallocated memory matches reference" {
+    var gs = Self.init(testing.allocator);
+    defer gs.deinit();
+
+    try expectKeccakMatchesReference(&gs, 1_000_000, 200);
+    try expectKeccakMatchesReference(&gs, 0, PAGE_SIZE);
+}
+
+test "keccak256Range: range larger than chunk buffer matches reference" {
+    var gs = Self.init(testing.allocator);
+    defer gs.deinit();
+
+    // Several pages of data with varied content.
+    var i: u256 = 0;
+    while (i < 5 * PAGE_SIZE) : (i += 32) {
+        try gs.memStore(i, i *% 0x9E3779B97F4A7C15);
+    }
+
+    try expectKeccakMatchesReference(&gs, 0, 5 * PAGE_SIZE);
+    try expectKeccakMatchesReference(&gs, 7, 5 * PAGE_SIZE - 13);
+}
+
+test "keccak256Range: empty range hash equals known empty Keccak256" {
+    var gs = Self.init(testing.allocator);
+    defer gs.deinit();
+
+    var hash: [32]u8 = undefined;
+    try gs.keccak256Range(0, 0, &hash);
+    const empty_keccak: u256 = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470;
+    try testing.expectEqual(empty_keccak, std.mem.readInt(u256, &hash, .big));
+}
+
+test "keccak256Range: rejects len exceeding usize" {
+    var gs = Self.init(testing.allocator);
+    defer gs.deinit();
+
+    var hash: [32]u8 = undefined;
+    const huge: u256 = @as(u256, std.math.maxInt(usize)) + 1;
+    try testing.expectError(error.MemoryRangeTooLarge, gs.keccak256Range(0, huge, &hash));
 }
 
 // ── Trace Tests ──────────────────────────────────────────────────────
