@@ -804,7 +804,7 @@ fn evalBuiltin(self: *Self, tag: BuiltinTag, args: []const u256) InterpreterErro
         },
         // Context getters
         .address => .{ .single = self.global.address },
-        .balance => .{ .single = 0 }, // stub
+        .balance => .{ .single = self.stub("balance") },
         .origin => .{ .single = self.global.origin },
         .caller => .{ .single = self.global.caller },
         .callvalue => .{ .single = self.global.callvalue },
@@ -815,9 +815,9 @@ fn evalBuiltin(self: *Self, tag: BuiltinTag, args: []const u256) InterpreterErro
         .prevrandao => .{ .single = self.global.prevrandao },
         .gaslimit => .{ .single = self.global.gaslimit },
         .chainid => .{ .single = self.global.chainid },
-        .selfbalance => .{ .single = 0 }, // stub
+        .selfbalance => .{ .single = self.stub("selfbalance") },
         .basefee => .{ .single = self.global.basefee },
-        .blobhash => .{ .single = 0 }, // stub
+        .blobhash => .{ .single = self.stub("blobhash") },
         .blobbasefee => .{ .single = self.global.blobbasefee },
         .gas => .{ .single = @as(u256, 1) << 64 },
         .codesize => .{ .single = 0 },
@@ -831,7 +831,7 @@ fn evalBuiltin(self: *Self, tag: BuiltinTag, args: []const u256) InterpreterErro
             try self.global.keccak256Range(offset, len, &hash);
             break :blk .{ .single = std.mem.readInt(u256, &hash, .big) };
         },
-        .blockhash => .{ .single = 0 }, // stub
+        .blockhash => .{ .single = self.stub("blockhash") },
         // Arithmetic
         .clz => .{ .single = u256_ops.clz_(args[0]) },
         // Control flow halts
@@ -854,29 +854,48 @@ fn evalBuiltin(self: *Self, tag: BuiltinTag, args: []const u256) InterpreterErro
             return error.ExecutionHalt;
         },
         // Contract interaction (stubs — always fail)
-        .call, .callcode => .{ .single = 0 },
-        .delegatecall, .staticcall => .{ .single = 0 },
-        .create, .create2 => .{ .single = 0 },
-        .extcodesize => .{ .single = 0 },
-        .extcodehash => .{ .single = 0 },
-        .selfdestruct => .none,
+        .call => .{ .single = self.stub("call") },
+        .callcode => .{ .single = self.stub("callcode") },
+        .delegatecall => .{ .single = self.stub("delegatecall") },
+        .staticcall => .{ .single = self.stub("staticcall") },
+        .create => .{ .single = self.stub("create") },
+        .create2 => .{ .single = self.stub("create2") },
+        .extcodesize => .{ .single = self.stub("extcodesize") },
+        .extcodehash => .{ .single = self.stub("extcodehash") },
+        .selfdestruct => blk: {
+            _ = self.stub("selfdestruct");
+            break :blk .none;
+        },
         // Misc
         .pop => .none,
     };
 }
 
-fn copyToMemory(self: *Self, dest_off: u256, src_off: u256, len: u256, src: []const u8) !void {
+fn copyToMemory(self: *Self, dest_off: u256, src_off: u256, len: u256, src: []const u8) InterpreterError!void {
     if (len == 0) return;
-    const size: usize = if (len > 0x100000) 0x100000 else @intCast(len);
-    const buf = try self.allocator.alloc(u8, size);
-    defer self.allocator.free(buf);
-    @memset(buf, 0);
+    self.global.updateMsize(dest_off, len);
+
+    // How many bytes from `src` can we actually copy? Capped by what's
+    // remaining in src starting at src_off, and by the requested len.
+    var data_len: u256 = 0;
     if (src_off < src.len) {
-        const start: usize = @intCast(src_off);
-        const avail = @min(size, src.len - start);
-        @memcpy(buf[0..avail], src[start..][0..avail]);
+        const remaining: usize = src.len - @as(usize, @intCast(src_off));
+        data_len = @min(len, @as(u256, remaining));
     }
-    try self.global.memWrite(dest_off, buf);
+
+    if (data_len > 0) {
+        const start: usize = @intCast(src_off);
+        const n: usize = @intCast(data_len);
+        try self.global.memWrite(dest_off, src[start..][0..n]);
+    }
+
+    // Zero-fill the tail [dest_off + data_len, dest_off + len). With sparse
+    // memory, only existing pages need to be touched.
+    if (data_len < len) {
+        const zero_off = dest_off +% data_len;
+        const zero_len = len - data_len;
+        self.global.memZeroRange(zero_off, zero_len);
+    }
 }
 
 fn captureHaltData(self: *Self, offset: u256, len: u256) InterpreterError!void {
@@ -898,6 +917,16 @@ fn captureHaltData(self: *Self, offset: u256, len: u256) InterpreterError!void {
 
 fn bin(comptime op: fn (u256, u256) u256, args: []const u256) Values {
     return .{ .single = op(args[0], args[1]) };
+}
+
+/// Emit a one-line warning to the tracer that a stubbed builtin was hit
+/// and return zero. Trace write errors are suppressed since they should
+/// not derail program execution.
+fn stub(self: *Self, name: []const u8) u256 {
+    if (self.global.tracer) |w| {
+        w.print("WARN: {s} is a stub returning 0\n", .{name}) catch {};
+    }
+    return 0;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
