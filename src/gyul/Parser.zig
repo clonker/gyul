@@ -39,7 +39,7 @@ pub fn parseRoot(self: *Parser) !void {
     }
     _ = try self.expectToken(.brace_r);
 
-    const body = self.addSpan(self.scratch.items[scratch_top..]);
+    const body = try self.addSpan(self.scratch.items[scratch_top..]);
     self.nodes.items[0] = .{ .root = .{ .token = lbrace, .body = body } };
 }
 
@@ -87,7 +87,7 @@ fn parseBlock(self: *Parser) Error!ast.NodeIndex {
     }
     _ = try self.expectToken(.brace_r);
 
-    const stmts = self.addSpan(self.scratch.items[scratch_top..]);
+    const stmts = try self.addSpan(self.scratch.items[scratch_top..]);
     return self.addNode(.{ .block = .{ .token = lbrace, .stmts = stmts } });
 }
 
@@ -103,7 +103,7 @@ fn parseVariableDeclaration(self: *Parser) Error!ast.NodeIndex {
         try self.scratch.append(self.gpa, try self.parseIdentifierNode());
     }
 
-    const names = self.addSpan(self.scratch.items[scratch_top..]);
+    const names = try self.addSpan(self.scratch.items[scratch_top..]);
 
     var value: ast.NodeIndex = ast.null_node;
     if (self.peek() == .colon_assign) {
@@ -173,7 +173,7 @@ fn parseSwitch(self: *Parser) Error!ast.NodeIndex {
         }
     }
 
-    const cases = self.addSpan(self.scratch.items[scratch_top..]);
+    const cases = try self.addSpan(self.scratch.items[scratch_top..]);
     return self.addNode(.{ .switch_statement = .{
         .token = tok,
         .expr = expr,
@@ -196,7 +196,7 @@ fn parseFunctionDefinition(self: *Parser) Error!ast.NodeIndex {
         }
     }
     _ = try self.expectToken(.parenthesis_r);
-    const params = self.addSpan(self.scratch.items[params_top..]);
+    const params = try self.addSpan(self.scratch.items[params_top..]);
     self.scratch.shrinkRetainingCapacity(params_top);
 
     // Parse return variables
@@ -209,7 +209,7 @@ fn parseFunctionDefinition(self: *Parser) Error!ast.NodeIndex {
             try self.scratch.append(self.gpa, try self.parseIdentifierNode());
         }
     }
-    const return_vars = self.addSpan(self.scratch.items[rets_top..]);
+    const return_vars = try self.addSpan(self.scratch.items[rets_top..]);
     self.scratch.shrinkRetainingCapacity(rets_top);
 
     const body = try self.parseBlock();
@@ -263,7 +263,7 @@ fn parseIdentifierStatement(self: *Parser) Error!ast.NodeIndex {
 
     const assign_tok = try self.expectToken(.colon_assign);
     const value = try self.parseExpression();
-    const targets = self.addSpan(self.scratch.items[scratch_top..]);
+    const targets = try self.addSpan(self.scratch.items[scratch_top..]);
 
     return self.addNode(.{ .assignment = .{
         .token = assign_tok,
@@ -326,7 +326,7 @@ fn parseFunctionCallWithToken(self: *Parser, name_token: ast.TokenIndex) Error!a
     }
     _ = try self.expectToken(.parenthesis_r);
 
-    const args = self.addSpan(self.scratch.items[scratch_top..]);
+    const args = try self.addSpan(self.scratch.items[scratch_top..]);
     return self.addNode(.{ .function_call = .{ .token = name_token, .args = args } });
 }
 
@@ -395,9 +395,9 @@ fn addNode(self: *Parser, node: ast.Node) Error!ast.NodeIndex {
     return idx;
 }
 
-fn addSpan(self: *Parser, items: []const ast.NodeIndex) ast.Span {
+fn addSpan(self: *Parser, items: []const ast.NodeIndex) Error!ast.Span {
     const start: u32 = @intCast(self.extra.items.len);
-    self.extra.appendSlice(self.gpa, items) catch @panic("OOM");
+    try self.extra.appendSlice(self.gpa, items);
     return .{ .start = start, .len = @intCast(items.len) };
 }
 
