@@ -370,10 +370,9 @@ fn evalStringLiteral(self: *Self, tok: AST.TokenIndex) InterpreterError!Values {
                 '\'' => '\'',
                 'x' => blk: {
                     if (i + 2 >= inner.len) return error.InvalidLiteral;
-                    const hi = std.fmt.charToDigit(inner[i + 1], 16) catch return error.InvalidLiteral;
-                    const lo = std.fmt.charToDigit(inner[i + 2], 16) catch return error.InvalidLiteral;
+                    const byte = std.fmt.parseInt(u8, inner[i + 1 .. i + 3], 16) catch return error.InvalidLiteral;
                     i += 2;
-                    break :blk @as(u8, hi) * 16 + lo;
+                    break :blk byte;
                 },
                 else => return error.InvalidLiteral,
             };
@@ -399,15 +398,7 @@ fn evalHexLiteral(self: *Self, value_tok: AST.TokenIndex) InterpreterError!Value
     if (hex_str.len % 2 != 0 or hex_str.len > 64) return error.InvalidLiteral;
 
     var buf: [32]u8 = std.mem.zeroes([32]u8);
-    var pos: usize = 0;
-    var i: usize = 0;
-    while (i < hex_str.len) : (i += 2) {
-        const hi = std.fmt.charToDigit(hex_str[i], 16) catch return error.InvalidLiteral;
-        const lo = std.fmt.charToDigit(hex_str[i + 1], 16) catch return error.InvalidLiteral;
-        buf[pos] = @as(u8, hi) * 16 + lo;
-        pos += 1;
-    }
-
+    _ = std.fmt.hexToBytes(buf[0 .. hex_str.len / 2], hex_str) catch return error.InvalidLiteral;
     return .{ .single = std.mem.readInt(u256, &buf, .big) };
 }
 

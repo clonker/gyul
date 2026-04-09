@@ -67,17 +67,10 @@ pub fn main() !void {
             std.debug.print("Error: out of memory\n", .{});
             std.process.exit(1);
         };
-        for (0..calldata.len) |j| {
-            const hi = std.fmt.charToDigit(hex_str[j * 2], 16) catch {
-                std.debug.print("Error: invalid hex character in calldata\n", .{});
-                std.process.exit(1);
-            };
-            const lo = std.fmt.charToDigit(hex_str[j * 2 + 1], 16) catch {
-                std.debug.print("Error: invalid hex character in calldata\n", .{});
-                std.process.exit(1);
-            };
-            calldata[j] = @as(u8, hi) * 16 + lo;
-        }
+        _ = std.fmt.hexToBytes(calldata, hex_str) catch {
+            std.debug.print("Error: invalid hex character in calldata\n", .{});
+            std.process.exit(1);
+        };
     }
 
     var global = gyul.GlobalState.init(allocator);
