@@ -889,12 +889,13 @@ fn copyToMemory(self: *Self, dest_off: u256, src_off: u256, len: u256, src: []co
         try self.global.memWrite(dest_off, src[start..][0..n]);
     }
 
-    // Zero-fill the tail [dest_off + data_len, dest_off + len). With sparse
-    // memory, only existing pages need to be touched.
+    // Zero-fill the tail [dest_off + data_len, dest_off + len) modulo 2^256.
+    // memZeroRange treats memory as a ring buffer, so the wrapping addition
+    // for zero_off is sound; only existing pages need to be touched.
     if (data_len < len) {
         const zero_off = dest_off +% data_len;
         const zero_len = len - data_len;
-        self.global.memZeroRange(zero_off, zero_len);
+        try self.global.memZeroRange(zero_off, zero_len);
     }
 }
 

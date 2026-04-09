@@ -247,7 +247,9 @@ pub fn memWrite(self: *Self, offset: u256, data: []const u8) !void {
 
 /// Stream a range of memory through a Keccak-256 hasher without
 /// allocating the full range. Reads are page-aware: unallocated pages
-/// contribute zero bytes. Length is bounded only by `usize`.
+/// contribute zero bytes. The address space is treated as a ring buffer
+/// (matching EVM `MLOAD`/`MSTORE` semantics): the range [offset, offset+len)
+/// wraps modulo 2^256. Length is bounded only by `usize`.
 pub fn keccak256Range(self: *const Self, offset: u256, len: u256, out: *[32]u8) error{MemoryRangeTooLarge}!void {
     if (len > std.math.maxInt(usize)) return error.MemoryRangeTooLarge;
     var hasher = std.crypto.hash.sha3.Keccak256.init(.{});
@@ -272,24 +274,71 @@ pub fn keccak256Range(self: *const Self, offset: u256, len: u256, out: *[32]u8) 
 
 /// Zero a range of memory [offset, offset + len). Only existing pages
 /// are touched; unallocated pages stay absent because zero is the
-/// default for unmapped reads. Wrap-around addressing is not supported
-/// here — callers must ensure offset + len does not wrap.
-pub fn memZeroRange(self: *Self, offset: u256, len: u256) void {
+/// default for unmapped reads. The address space is a ring buffer
+/// (matching EVM semantics), so the range wraps modulo 2^256.
+///
+/// Length is bounded by `usize` so the page iteration is bounded. For
+/// larger requested ranges, returns `error.MemoryRangeTooLarge`.
+pub fn memZeroRange(self: *Self, offset: u256, len: u256) error{MemoryRangeTooLarge}!void {
     if (len == 0) return;
+    if (len > std.math.maxInt(usize)) return error.MemoryRangeTooLarge;
     self.updateMsize(offset, len);
+
+    const last_byte = offset +% (len - 1);
+    const first_page = offset >> PAGE_BITS;
+    const last_page = last_byte >> PAGE_BITS;
+
+    if (last_byte >= offset) {
+        // Non-wrapping range: walk page numbers from first_page to last_page.
+        self.zeroPagesByLookup(first_page, last_page, offset, len);
+    } else {
+        // Range wraps past max u256: walk [first_page, max_page] then [0, last_page].
+        const max_page: u256 = std.math.maxInt(u256) >> PAGE_BITS;
+        self.zeroPagesByLookup(first_page, max_page, offset, len);
+        self.zeroPagesByLookup(0, last_page, offset, len);
+    }
+}
+
+/// Look up each page number in [first_page, last_page] and zero whatever
+/// portion of it falls inside the destination range. Pages not in the map
+/// are skipped (so no allocations happen). Iteration is inclusive on both
+/// ends so the loop terminates correctly when last_page is at the very top
+/// of the page-number space.
+fn zeroPagesByLookup(self: *Self, first_page: u256, last_page: u256, offset: u256, len: u256) void {
+    var page_num = first_page;
+    while (true) : (page_num += 1) {
+        if (self.pages.get(page_num)) |page| {
+            zeroPageWithinRange(page, page_num << PAGE_BITS, offset, len);
+        }
+        if (page_num == last_page) break;
+    }
+}
+
+/// Zero the bytes of `page` (located at `page_start`) that fall within
+/// the destination range [offset, offset+len) modulo 2^256.
+fn zeroPageWithinRange(page: *Page, page_start: u256, offset: u256, len: u256) void {
     const end = offset +% len;
-    var it = self.pages.iterator();
-    while (it.next()) |entry| {
-        const page_num = entry.key_ptr.*;
-        const page_start: u256 = page_num << PAGE_BITS;
-        const page_end: u256 = page_start + PAGE_SIZE;
-        const lo = @max(offset, page_start);
-        const hi = @min(end, page_end);
-        if (lo >= hi) continue;
-        const page = entry.value_ptr.*;
-        const lo_in_page: usize = @intCast(lo - page_start);
-        const hi_in_page: usize = @intCast(hi - page_start);
-        @memset(page[lo_in_page..hi_in_page], 0);
+    const wraps = end < offset; // len > 0 ⇒ end == offset is impossible
+    // Last byte of the page. PAGE_SIZE is a power of two and pages are
+    // word-aligned, so this is page_start with the low bits set. Always
+    // fits in u256: the topmost page's last byte is exactly max u256.
+    const page_last: u256 = page_start | (PAGE_SIZE - 1);
+
+    if (!wraps) {
+        if (offset > page_last or end <= page_start) return;
+        const lo: usize = if (offset > page_start) @intCast(offset - page_start) else 0;
+        const hi: usize = if (end > page_last) PAGE_SIZE else @intCast(end - page_start);
+        @memset(page[lo..hi], 0);
+    } else {
+        // Range covers [offset, max u256] ∪ [0, end).
+        if (offset <= page_last) {
+            const lo: usize = if (offset > page_start) @intCast(offset - page_start) else 0;
+            @memset(page[lo..], 0);
+        }
+        if (end > page_start) {
+            const hi: usize = if (end > page_last) PAGE_SIZE else @intCast(end - page_start);
+            @memset(page[0..hi], 0);
+        }
     }
 }
 
@@ -631,6 +680,136 @@ test "keccak256Range: rejects len exceeding usize" {
     var hash: [32]u8 = undefined;
     const huge: u256 = @as(u256, std.math.maxInt(usize)) + 1;
     try testing.expectError(error.MemoryRangeTooLarge, gs.keccak256Range(0, huge, &hash));
+}
+
+test "keccak256Range: ring-buffer wrap from top of address space to zero" {
+    var gs = Self.init(testing.allocator);
+    defer gs.deinit();
+
+    const max = std.math.maxInt(u256);
+    // Write a marker into the topmost page (last 4 bytes of u256 space) and
+    // a marker at address 0 (page 0). A range starting near the top with a
+    // length that crosses 2^256 should hash both markers.
+    try gs.memStore8(max - 3, 0x11);
+    try gs.memStore8(max - 2, 0x22);
+    try gs.memStore8(max - 1, 0x33);
+    try gs.memStore8(max - 0, 0x44);
+    try gs.memStore8(0, 0x55);
+    try gs.memStore8(1, 0x66);
+
+    // Hash 6 bytes starting at max-3: should see 0x11,0x22,0x33,0x44,0x55,0x66.
+    var streaming: [32]u8 = undefined;
+    try gs.keccak256Range(max - 3, 6, &streaming);
+
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha3.Keccak256.hash(&[_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, &expected, .{});
+
+    try testing.expectEqualSlices(u8, &expected, &streaming);
+}
+
+// ── memZeroRange Tests ───────────────────────────────────────────────
+
+/// Reference: byte-wise zero of [offset, offset+len) modulo 2^256, but
+/// only touching pages that already exist (so it matches memZeroRange's
+/// "leave unallocated pages absent" contract). O(len) — keep len small.
+fn referenceMemZero(gs: *Self, offset: u256, len: u256) void {
+    var i: u256 = 0;
+    while (i < len) : (i += 1) {
+        const addr = offset +% i;
+        const page_num = addr >> PAGE_BITS;
+        if (gs.pages.get(page_num)) |page| {
+            const idx: u12 = @intCast(addr & (PAGE_SIZE - 1));
+            page[idx] = 0;
+        }
+    }
+}
+
+/// Compare two GlobalStates: same set of pages and same byte contents.
+fn expectStatesEqual(a: *const Self, b: *const Self) !void {
+    try testing.expectEqual(a.pages.count(), b.pages.count());
+    var it = a.pages.iterator();
+    while (it.next()) |entry| {
+        const other = b.pages.get(entry.key_ptr.*) orelse return error.PageMissing;
+        try testing.expectEqualSlices(u8, entry.value_ptr.*, other);
+    }
+}
+
+fn expectMemZeroMatchesReference(seed: *const fn (*Self) anyerror!void, offset: u256, len: u256) !void {
+    var streaming = Self.init(testing.allocator);
+    defer streaming.deinit();
+    try seed(&streaming);
+    try streaming.memZeroRange(offset, len);
+
+    var reference = Self.init(testing.allocator);
+    defer reference.deinit();
+    try seed(&reference);
+    referenceMemZero(&reference, offset, len);
+
+    try expectStatesEqual(&streaming, &reference);
+}
+
+fn seedTwoPages(gs: *Self) anyerror!void {
+    try gs.memStore(0, 0xAAAA_BBBB_CCCC_DDDD);
+    try gs.memStore(PAGE_SIZE - 32, 0x1111_2222);
+    try gs.memStore(PAGE_SIZE, 0x3333_4444);
+    try gs.memStore(PAGE_SIZE * 3, 0xDEAD_BEEF);
+}
+
+fn seedTopAndBottom(gs: *Self) anyerror!void {
+    const max = std.math.maxInt(u256);
+    // Touch the topmost page and page 0 with non-zero data.
+    var i: u256 = 0;
+    while (i < 64) : (i += 1) {
+        try gs.writeByte(max - i, @intCast((i & 0x3F) | 0x80));
+        try gs.writeByte(i, @intCast((i & 0x3F) | 0x40));
+    }
+}
+
+test "memZeroRange: non-wrap ranges match reference" {
+    try expectMemZeroMatchesReference(&seedTwoPages, 16, 64);
+    try expectMemZeroMatchesReference(&seedTwoPages, PAGE_SIZE - 8, 16);
+    try expectMemZeroMatchesReference(&seedTwoPages, 0, 4 * PAGE_SIZE);
+    try expectMemZeroMatchesReference(&seedTwoPages, 32, 0);
+}
+
+test "memZeroRange: wrap ranges match reference" {
+    const max = std.math.maxInt(u256);
+    try expectMemZeroMatchesReference(&seedTopAndBottom, max - 31, 64);
+    try expectMemZeroMatchesReference(&seedTopAndBottom, max - 7, 16);
+    try expectMemZeroMatchesReference(&seedTopAndBottom, max, 2);
+}
+
+test "memZeroRange: never allocates new pages" {
+    var gs = Self.init(testing.allocator);
+    defer gs.deinit();
+
+    try gs.memStore(0, 1);
+    const before = gs.pages.count();
+
+    // Range entirely in unallocated address space.
+    try gs.memZeroRange(PAGE_SIZE * 100, PAGE_SIZE * 10);
+    try testing.expectEqual(before, gs.pages.count());
+}
+
+test "memZeroRange: wrap range zeroes both halves of the ring" {
+    var gs = Self.init(testing.allocator);
+    defer gs.deinit();
+
+    try gs.memStore(0, 0xAAAA);
+    try gs.writeByte(std.math.maxInt(u256), 0xFF);
+
+    // Range starts at max u256, length 65 → covers byte at max plus bytes 0..63.
+    try gs.memZeroRange(std.math.maxInt(u256), 65);
+
+    try testing.expectEqual(@as(u8, 0), gs.readByte(std.math.maxInt(u256)));
+    try testing.expectEqual(@as(u256, 0), try gs.memLoad(0));
+}
+
+test "memZeroRange: rejects len exceeding usize" {
+    var gs = Self.init(testing.allocator);
+    defer gs.deinit();
+    const huge: u256 = @as(u256, std.math.maxInt(usize)) + 1;
+    try testing.expectError(error.MemoryRangeTooLarge, gs.memZeroRange(0, huge));
 }
 
 // ── Trace Tests ──────────────────────────────────────────────────────
