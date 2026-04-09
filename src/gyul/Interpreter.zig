@@ -881,20 +881,21 @@ fn copyToMemory(self: *Self, dest_off: u256, src_off: u256, len: u256, src: []co
     try self.global.memWrite(dest_off, buf);
 }
 
-fn captureHaltData(self: *Self, offset: u256, len: u256) !void {
+fn captureHaltData(self: *Self, offset: u256, len: u256) InterpreterError!void {
     if (self.global.return_data_owned) {
         self.allocator.free(self.global.return_data);
         self.global.return_data = &.{};
         self.global.return_data_owned = false;
     }
-    if (len > 0) {
-        self.global.updateMsize(offset, len);
-        const size: usize = if (len > 0x1000000) 0x1000000 else @intCast(len);
-        const buf = try self.allocator.alloc(u8, size);
-        self.global.memRead(offset, buf);
-        self.global.return_data = buf;
-        self.global.return_data_owned = true;
-    }
+    if (len == 0) return;
+    self.global.updateMsize(offset, len);
+    if (len > std.math.maxInt(usize)) return error.ReturnDataTooLarge;
+    const size: usize = @intCast(len);
+    const buf = try self.allocator.alloc(u8, size);
+    errdefer self.allocator.free(buf);
+    self.global.memRead(offset, buf);
+    self.global.return_data = buf;
+    self.global.return_data_owned = true;
 }
 
 fn bin(comptime op: fn (u256, u256) u256, args: []const u256) Values {
