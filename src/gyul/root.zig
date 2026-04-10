@@ -7,6 +7,10 @@ pub const PagedMemory = @import("PagedMemory.zig");
 pub const GlobalState = @import("GlobalState.zig");
 pub const LocalState = @import("LocalState.zig");
 pub const Interpreter = @import("Interpreter.zig");
+pub const EVMBuiltins = @import("EVMBuiltins.zig");
+pub const Checker = @import("Checker.zig");
+pub const ObjectTree = @import("ObjectTree.zig");
+pub const Chain = @import("Chain.zig");
 
 pub const GYulTokenizer = tokenizer.GYulTokenizer;
 
@@ -22,4 +26,8 @@ test {
     _ = @import("GlobalState.zig");
     _ = @import("LocalState.zig");
     _ = @import("Interpreter.zig");
+    _ = @import("EVMBuiltins.zig");
+    _ = @import("Checker.zig");
+    _ = @import("ObjectTree.zig");
+    _ = @import("Chain.zig");
 }

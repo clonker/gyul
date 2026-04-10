@@ -1,14 +1,27 @@
 //! Sparse byte-addressable memory backed by 4 KiB pages.
 //!
-//! The address space is `u256`, treated as a ring buffer modulo 2^256
-//! (matching EVM `MLOAD`/`MSTORE` semantics). Pages are heap-allocated and
-//! kept in a hashmap keyed by `offset >> PAGE_BITS`. Reads from missing
-//! pages return zero. Writes allocate pages on demand.
+//! The address space is `u256`. Pages are heap-allocated and kept in a
+//! hashmap keyed by `offset >> PAGE_BITS`. Reads from missing pages
+//! return zero. Writes allocate pages on demand.
 //!
-//! All length-taking operations are bounded by `usize` and reject larger
-//! requests with `error.MemoryRangeTooLarge`. The iteration over pages is
-//! page-aware (`Segments`), so a single `MLOAD`/`MSTORE` is at most two
-//! hash lookups instead of 32 byte-by-byte lookups.
+//! Wraparound semantics: page iteration uses wrapping arithmetic
+//! (`+%`) at the offset-computation level so that pathological inputs
+//! still produce a deterministic answer instead of crashing the
+//! interpreter. This is **not** EVM-spec semantics — the yellow paper
+//! explicitly notes that "the addition in the calculation of μ_i' is
+//! not subject to the 2²⁵⁶ modulo" for every memory-touching opcode
+//! (MLOAD/MSTORE/MSTORE8/CALLDATACOPY/CODECOPY/EXTCODECOPY/RETURNDATACOPY,
+//! pages 33–35). Real EVM detects the overflow as out-of-gas. The
+//! `GlobalState.accessMemory` chokepoint enforces this in strict mode
+//! by rejecting wrapping accesses with `error.MemoryRangeTooLarge`,
+//! which the interpreter's top-level catch converts to a revert. This
+//! file's wrapping is a fallback for inputs that would never reach it
+//! in spec-compliant execution.
+//!
+//! All length-taking operations are bounded by `usize` and reject
+//! larger requests with `error.MemoryRangeTooLarge`. The iteration
+//! over pages is page-aware (`Segments`), so a single `MLOAD`/`MSTORE`
+//! is at most two hash lookups instead of 32 byte-by-byte lookups.
 
 const std = @import("std");
 const sparse = @import("sparse.zig");

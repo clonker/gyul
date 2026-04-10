@@ -136,7 +136,11 @@ pub const GYulTokenizer = struct {
                     result.tag = .number_literal;
                     continue :state .number_literal;
                 },
-                '_', 'a' ... 'z', 'A' ... 'Z' => {
+                '_', '$', 'a' ... 'z', 'A' ... 'Z' => {
+                    // Yul identifiers: `[a-zA-Z_$] [a-zA-Z_$0-9.]*`.
+                    // `$` and `.` are heavily used by solc for type-
+                    // mangled function names like
+                    // `array_length_t_array$_t_uint256_$8_storage`.
                     result.tag = .identifier;
                     continue :state .identifier;
                 },
@@ -209,7 +213,7 @@ pub const GYulTokenizer = struct {
             .identifier => {
                 self.index += 1;
                 switch (self.buffer[self.index]) {
-                    'a'...'z', 'A'...'Z', '_', '0'...'9' => continue :state .identifier,
+                    'a'...'z', 'A'...'Z', '_', '$', '.', '0'...'9' => continue :state .identifier,
                     else => {
                         if (Token.keywords.get(self.buffer[result.loc.start..self.index])) |tag| {
                             result.tag = tag;

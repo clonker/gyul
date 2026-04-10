@@ -3,6 +3,15 @@ const std = @import("std");
 const max_u256: u256 = std.math.maxInt(u256);
 const min_i256: i256 = std.math.minInt(i256);
 
+/// 160-bit mask. EVM addresses are 160 bits; values stored in u256 fields
+/// (caller, address, origin, ...) and arguments to address-typed builtins
+/// (balance, extcodesize, ...) must be masked to this width.
+pub const ADDRESS_MASK: u256 = (@as(u256, 1) << 160) - 1;
+
+pub fn maskAddress(addr: u256) u256 {
+    return addr & ADDRESS_MASK;
+}
+
 // ── Arithmetic (wrapping mod 2^256) ──────────────────────────────────
 
 pub fn add(x: u256, y: u256) u256 {

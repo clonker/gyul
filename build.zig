@@ -53,4 +53,21 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
+
+    // Differential corpus test against vendor/solidity yul optimizer
+    // fixtures. Slow (642 fixtures) and depends on the submodule being
+    // checked out, so it's its own build step rather than part of the
+    // default `zig build test`.
+    const spec_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/gyul/spec_corpus_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const spec_unit_tests = b.addTest(.{
+        .root_module = spec_test_mod,
+    });
+    const run_spec_unit_tests = b.addRunArtifact(spec_unit_tests);
+    run_spec_unit_tests.has_side_effects = true; // always re-run, never cache
+    const spec_test_step = b.step("spec-test", "Run yul optimizer corpus differential tests");
+    spec_test_step.dependOn(&run_spec_unit_tests.step);
 }

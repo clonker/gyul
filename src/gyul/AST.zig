@@ -3,6 +3,9 @@ const tokenizer = @import("tokenizer.zig");
 const Parser = @import("Parser.zig");
 const Printer = @import("ASTPrinter.zig");
 const YulGen = @import("YulGen.zig");
+const ObjectTreeMod = @import("ObjectTree.zig");
+pub const ObjectTree = ObjectTreeMod.ObjectTree;
+pub const ObjectTreeRoot = ObjectTreeMod.ObjectTreeRoot;
 
 const Self = @This();
 
@@ -11,6 +14,9 @@ tokens: TokenList.Slice,
 nodes: []const Node,
 extra: []const NodeIndex,
 errors: []const Error,
+/// Top-level Yul object `data "name" ...` sections, decoded to bytes.
+/// Empty when the source is a bare `{ ... }` block. Owned by the AST.
+data_sections: std.StringHashMapUnmanaged([]const u8),
 
 pub const TokenIndex = u32;
 pub const ByteOffset = u32;
@@ -159,11 +165,17 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) !Self {
         .nodes = .{},
         .extra = .{},
         .scratch = .{},
+        .data_sections = .{},
     };
     defer parser.scratch.deinit(gpa);
     errdefer parser.nodes.deinit(gpa);
     errdefer parser.extra.deinit(gpa);
     errdefer parser.errors.deinit(gpa);
+    errdefer {
+        var it = parser.data_sections.iterator();
+        while (it.next()) |e| gpa.free(e.value_ptr.*);
+        parser.data_sections.deinit(gpa);
+    }
     try parser.parseRoot();
 
     const nodes = try parser.nodes.toOwnedSlice(gpa);
@@ -181,7 +193,146 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8) !Self {
         .nodes = nodes,
         .extra = extra,
         .errors = errors,
+        .data_sections = parser.data_sections,
     };
+}
+
+/// Result of `parseAny`. Source files that begin with an `object`
+/// wrapper produce an `ObjectTreeRoot`; everything else (bare `{ ... }`
+/// blocks) produces a flat `AST` matching the legacy shape.
+pub const ParseResult = union(enum) {
+    bare: Self,
+    tree: ObjectTreeRoot,
+
+    pub fn deinit(self: *ParseResult, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .bare => |*a| a.deinit(gpa),
+            .tree => |*t| t.deinit(gpa),
+        }
+    }
+};
+
+/// Parse failure with byte offset of the offending token (for error
+/// reporting). Set as a thread-local by `parseAny` on failure.
+pub var last_parse_error_offset: ByteOffset = 0;
+
+/// New entry point that knows about object syntax. Bare blocks become
+/// `.bare`; object-wrapped sources become `.tree`. The legacy `parse`
+/// function is unchanged for backwards compat with existing tests.
+pub fn parseAny(gpa: std.mem.Allocator, source: [:0]const u8) !ParseResult {
+    if (source.len > std.math.maxInt(ByteOffset)) return error.SourceTooLarge;
+
+    var tokens = TokenList{};
+    defer tokens.deinit(gpa);
+
+    {
+        var lex = tokenizer.GYulTokenizer.init(source);
+        var tok = lex.next();
+        while (tok.tag != .eof) : (tok = lex.next()) {
+            try tokens.append(gpa, .{
+                .tag = tok.tag,
+                .start = @as(ByteOffset, tok.loc.start),
+            });
+        }
+        try tokens.append(gpa, .{
+            .tag = .eof,
+            .start = @as(ByteOffset, tok.loc.start),
+        });
+    }
+
+    // Detect mode by looking for an `object` identifier as the first
+    // non-comment token. This mirrors the logic in `Parser.parseRoot`.
+    const tags = tokens.items(.tag);
+    const starts = tokens.items(.start);
+    var i: usize = 0;
+    while (i < tags.len and (tags[i] == .comment_single_line or tags[i] == .comment_multi_line)) : (i += 1) {}
+    const is_object = i < tags.len and tags[i] == .identifier and blk: {
+        const start = starts[i];
+        const end: ByteOffset = if (i + 1 < starts.len) starts[i + 1] else @intCast(source.len);
+        var e = end;
+        while (e > start and (source[e - 1] == ' ' or source[e - 1] == '\n' or source[e - 1] == '\t' or source[e - 1] == '\r')) {
+            e -= 1;
+        }
+        break :blk std.mem.eql(u8, source[start..e], "object");
+    };
+
+    var parser: Parser = .{
+        .gpa = gpa,
+        .source = source,
+        .token_tags = tokens.items(.tag),
+        .token_starts = tokens.items(.start),
+        .tok_i = 0,
+        .depth = 0,
+        .errors = .{},
+        .nodes = .{},
+        .extra = .{},
+        .scratch = .{},
+        .data_sections = .{},
+    };
+    defer parser.scratch.deinit(gpa);
+    errdefer parser.nodes.deinit(gpa);
+    errdefer parser.extra.deinit(gpa);
+    errdefer parser.errors.deinit(gpa);
+    errdefer {
+        var it = parser.data_sections.iterator();
+        while (it.next()) |e| {
+            // Legacy data_sections has unowned keys (slices into source);
+            // only free values.
+            gpa.free(e.value_ptr.*);
+        }
+        parser.data_sections.deinit(gpa);
+    }
+
+    if (is_object) {
+        var root_obj: ObjectTree = undefined;
+        var root_initialized = false;
+        errdefer if (root_initialized) root_obj.deinit(gpa);
+        parser.parseRootObjectTree(&root_obj) catch |err| {
+            last_parse_error_offset = if (parser.tok_i < parser.token_starts.len)
+                parser.token_starts[parser.tok_i]
+            else
+                @intCast(source.len);
+            return err;
+        };
+        root_initialized = true;
+
+        const nodes = try parser.nodes.toOwnedSlice(gpa);
+        errdefer gpa.free(nodes);
+        const extra = try parser.extra.toOwnedSlice(gpa);
+        errdefer gpa.free(extra);
+        const errors = try parser.errors.toOwnedSlice(gpa);
+        errdefer gpa.free(errors);
+
+        // The legacy `data_sections` map should be empty in tree mode.
+        parser.data_sections.deinit(gpa);
+
+        return .{ .tree = .{
+            .source = source,
+            .tokens = tokens.toOwnedSlice(),
+            .nodes = nodes,
+            .extra = extra,
+            .errors = errors,
+            .root = root_obj,
+        } };
+    }
+
+    try parser.parseRoot();
+
+    const nodes = try parser.nodes.toOwnedSlice(gpa);
+    errdefer gpa.free(nodes);
+    const extra = try parser.extra.toOwnedSlice(gpa);
+    errdefer gpa.free(extra);
+    const errors = try parser.errors.toOwnedSlice(gpa);
+    errdefer gpa.free(errors);
+
+    return .{ .bare = .{
+        .source = source,
+        .tokens = tokens.toOwnedSlice(),
+        .nodes = nodes,
+        .extra = extra,
+        .errors = errors,
+        .data_sections = parser.data_sections,
+    } };
 }
 
 pub fn print(self: *const Self, gpa: std.mem.Allocator) ![]u8 {
@@ -193,6 +344,9 @@ pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
     gpa.free(self.nodes);
     gpa.free(self.extra);
     gpa.free(self.errors);
+    var it = self.data_sections.iterator();
+    while (it.next()) |e| gpa.free(e.value_ptr.*);
+    self.data_sections.deinit(gpa);
     self.* = undefined;
 }
 
@@ -337,6 +491,76 @@ test "parse error: missing opening brace" {
 
 test "parse error: missing closing brace" {
     try expectParseError("{ let x := 1");
+}
+
+test "parse object: data sections captured into ast" {
+    const allocator = std.testing.allocator;
+    const source: [:0]const u8 =
+        \\object "Outer" {
+        \\  code { sstore(0, 1) }
+        \\  data "msg" "hello"
+        \\  data "raw" hex"deadbeef"
+        \\}
+    ;
+    var ast = try Self.parse(allocator, source);
+    defer ast.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), ast.data_sections.count());
+    try std.testing.expectEqualSlices(u8, "hello", ast.data_sections.get("msg").?);
+    try std.testing.expectEqualSlices(u8, &.{ 0xDE, 0xAD, 0xBE, 0xEF }, ast.data_sections.get("raw").?);
+}
+
+test "parseAny: bare block returns .bare" {
+    const allocator = std.testing.allocator;
+    var result = try Self.parseAny(allocator, "{ let x := 1 }");
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .bare);
+}
+
+test "parseAny: object source returns .tree with sub-objects" {
+    const allocator = std.testing.allocator;
+    const source: [:0]const u8 =
+        \\object "C" {
+        \\  code { sstore(0, 42) }
+        \\  object "C_deployed" {
+        \\    code { mstore(0, sload(0)) return(0, 32) }
+        \\    data "msg" "hi"
+        \\  }
+        \\}
+    ;
+    var result = try Self.parseAny(allocator, source);
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result == .tree);
+    const root = &result.tree.root;
+    try std.testing.expectEqualStrings("C", root.name);
+    try std.testing.expect(root.code_root != null_node);
+    try std.testing.expect(root.sentinel != 0);
+
+    try std.testing.expectEqual(@as(usize, 1), root.children.len);
+    const child = &root.children[0];
+    try std.testing.expectEqualStrings("C_deployed", child.name);
+    try std.testing.expect(child.code_root != null_node);
+    try std.testing.expect(child.sentinel != 0);
+    try std.testing.expect(child.sentinel != root.sentinel);
+
+    try std.testing.expectEqual(@as(u32, 1), child.data.count());
+    try std.testing.expectEqualSlices(u8, "hi", child.data.get("msg").?);
+}
+
+test "parseAny: tree slot 0 is .root pointing at root code block" {
+    const allocator = std.testing.allocator;
+    const source: [:0]const u8 = "object \"X\" { code { sstore(0, 1) } }";
+    var result = try Self.parseAny(allocator, source);
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result == .tree);
+    const tree = &result.tree;
+    try std.testing.expect(tree.nodes[0] == .root);
+    const body = tree.nodes[0].root.body;
+    try std.testing.expectEqual(@as(u32, 1), body.len);
+    const code_idx = tree.extra[body.start];
+    try std.testing.expectEqual(tree.root.code_root, code_idx);
+    try std.testing.expect(tree.nodes[code_idx] == .block);
 }
 
 test "fuzz parser raw bytes" {

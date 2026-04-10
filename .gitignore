@@ -3,3 +3,4 @@
 /.idea
 /vendor/solidity/build/
 /test/ref/build/
+/tmp
